@@ -255,6 +255,31 @@ function wantsFlag(value, fallback) {
   return fallback === true
 }
 
+// 规范化目录排除清单：接受字符串或字符串数组，按逗号/分号拆分，去掉引号、
+// 空白与结尾分隔符，转小写并去重；空值回退到调用方给出的默认清单。
+function normalizeExcludes(value, fallback) {
+  const source = value === undefined || value === null ? fallback : value
+  const list = []
+  const add = (item) => {
+    if (typeof item !== 'string') return
+    for (const part of item.split(/[,;]/)) {
+      const trimmed = part.trim().replace(/^["']|["']$/g, '').replace(/[\\/]+$/, '')
+      if (trimmed && !list.includes(trimmed)) list.push(trimmed)
+    }
+  }
+  if (Array.isArray(source)) source.forEach(add)
+  else add(String(source))
+  return list
+}
+
+// 把排除清单追加为引擎参数；空清单不追加，保持不排除时的旧行为。
+// 以逗号拼接成单个参数，避免 -File 传参把多个值解析成位置参数。
+function appendExcludes(args, excludes) {
+  if (!Array.isArray(excludes) || excludes.length === 0) return args
+  args.push('-ExcludeDirs', excludes.join(','))
+  return args
+}
+
 /** Resolve one Session by id through whichever Host service owns it. */
 function resolveSession(ctx, sessionId) {
   if (typeof sessionId !== 'string' || !sessionId) return undefined
@@ -400,6 +425,7 @@ function createOperations(ctx, config) {
           autoClean: config.autoClean !== false,
           removeAces: config.removeAces === true,
           scanAllFiles: config.scanAllFiles === true,
+          excludeDirs: config.excludeDirs,
         },
       }
     },
@@ -408,6 +434,7 @@ function createOperations(ctx, config) {
       const root = normalizeRoot(input.path)
       const args = ['-Action', 'scan', '-Path', root, '-Json']
       if (wantsFlag(input.allFiles, config.scanAllFiles)) args.push('-AllFiles')
+      appendExcludes(args, normalizeExcludes(input.excludeDirs, config.excludeDirs))
       return run(args)
     },
 
@@ -437,6 +464,7 @@ function createOperations(ctx, config) {
       if (wantsFlag(input.allFiles, config.scanAllFiles)) args.push('-AllFiles')
       if (input.fast === true) args.push('-Fast')
       if (input.whatIf === true) args.push('-WhatIf')
+      appendExcludes(args, normalizeExcludes(input.excludeDirs, config.excludeDirs))
       const result = await withRootLock(root, () => run(args))
       if (!fastWithoutScan) return result
       const warning = 'fast repair: the pre-scan was skipped, so no ACE was removed; run a full repair to remove them'
@@ -447,6 +475,7 @@ function createOperations(ctx, config) {
       const root = normalizeRoot(input.path)
       const args = ['-Action', 'verify', '-Path', root, '-Json']
       if (wantsFlag(input.allFiles, config.scanAllFiles)) args.push('-AllFiles')
+      appendExcludes(args, normalizeExcludes(input.excludeDirs, config.excludeDirs))
       return run(args)
     },
 
@@ -468,7 +497,11 @@ function createOperations(ctx, config) {
         const manifest = JSON.parse(readFileSync(join(backupDir, 'manifest.json'), 'utf8'))
         if (typeof manifest?.root === 'string') root = manifest.root
       } catch { /* unreadable record: the engine reports it */ }
-      return withRootLock(root || `record:${backupDir}`, () => run(['-Action', 'rollback', '-BackupDir', backupDir, '-Json']))
+      return withRootLock(root || `record:${backupDir}`, () => {
+        const args = ['-Action', 'rollback', '-BackupDir', backupDir, '-Json']
+        appendExcludes(args, config.excludeDirs)
+        return run(args)
+      })
     },
   }
 }
@@ -482,6 +515,7 @@ function summary(action, payload) {
   if (typeof payload.unreadable === 'number') lines.push(`unreadable objects: ${payload.unreadable}`)
   if (typeof payload.labelsFixed === 'number') lines.push(`labels changed: ${payload.labelsFixed}`)
   if (typeof payload.removedAces === 'number') lines.push(`ACEs removed: ${payload.removedAces}`)
+  if (typeof payload.excluded === 'number') lines.push(`excluded directories: ${payload.excluded}`)
   if (payload.acesSkipped === true) lines.push('ACE removal skipped')
   if (typeof payload.restored === 'number') lines.push(`objects restored: ${payload.restored}`)
   if (typeof payload.objectsRestored === 'number') lines.push(`object DACLs restored: ${payload.objectsRestored}`)
@@ -502,9 +536,12 @@ export function apply(ctx, rawConfig = {}) {
     autoClean: true,
     removeAces: false,
     scanAllFiles: false,
+    excludeDirs: ['.git', '.hg', '.svn'],
     ...(rawConfig || {}),
   }
-  if (IS_WIN) log(`plugin mounted (autoClean=${config.autoClean})`)
+  // 配置可能写成字符串或数组；统一规范化，后续扫描/修复/回滚共用同一份清单。
+  config.excludeDirs = normalizeExcludes(config.excludeDirs, ['.git', '.hg', '.svn'])
+  if (IS_WIN) log(`plugin mounted (autoClean=${config.autoClean}, excludeDirs=${config.excludeDirs.join(',')})`)
 
   const operations = createOperations(ctx, config)
 
@@ -552,6 +589,11 @@ export function apply(ctx, rawConfig = {}) {
         type: 'boolean',
         description: 'Return the planned fix without writing a rollback record or touching any ACL.',
       },
+      excludeDirs: {
+        type: 'array',
+        items: { type: 'string' },
+        description: 'Directory names (any depth) or relative-path prefixes to skip while scanning, fixing and verifying. Defaults to the plugin config (.git, .hg, .svn); the root itself is always checked.',
+      },
     },
     output: {
       schema: {
@@ -590,6 +632,7 @@ export function apply(ctx, rawConfig = {}) {
         fast: args.fast,
         force: args.force,
         whatIf: args.whatIf,
+        excludeDirs: args.excludeDirs,
         trigger: 'tool',
         sessionId: exec?.agent?.session?.id,
       }

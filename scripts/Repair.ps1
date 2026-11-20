@@ -22,11 +22,16 @@
     [ValidateRange(1, 2147483647)]
     [int]$MaxObjects = 20000,
 
-    # Explicit opt-in for a root this script considers dangerous (drive root,
-    # %SystemRoot%, %ProgramFiles%, %ProgramData%, the profile root).
+    # 目录排除清单：不含反斜杠的条目按目录名匹配任意层级，含反斜杠的条目按
+    # 相对根的路径前缀匹配。默认排除版本库元数据目录，避免 .git 等子树
+    # 淹没命中并触发 MaxObjects 截断。根目录自身不受排除影响。
+    [string[]]$ExcludeDirs = @('.git', '.hg', '.svn'),
+
+    # 显式允许操作本脚本判定为危险的目标（盘根、SystemRoot、Program Files、
+    # ProgramData、用户目录根）。
     [switch]$AllowDangerousRoot,
 
-    # Print the planned fix without writing a record or touching any ACL.
+    # 只输出修复计划，不写回滚记录、不修改任何 ACL。
     [switch]$WhatIf
 )
 
@@ -656,6 +661,41 @@ function Test-Skip([string]$p) {
     return ($name -eq '$Recycle.Bin' -or $name -eq 'System Volume Information')
 }
 
+# 规范化排除清单：接受数组或逗号/分号分隔的字符串，去掉引号、空白与结尾
+# 分隔符，去重后返回小写条目。
+function ConvertTo-ExcludeList([string[]]$values) {
+    $list = New-Object System.Collections.ArrayList
+    foreach ($value in @($values)) {
+        if (-not $value) { continue }
+        foreach ($part in ($value -split '[,;]')) {
+            $item = $part.Trim().Trim('"').Trim("'").TrimEnd('\').ToLowerInvariant()
+            if ($item -and -not $list.Contains($item)) { [void]$list.Add($item) }
+        }
+    }
+    return @($list)
+}
+
+# 判断路径是否落在排除清单内。不含反斜杠的条目按目录名匹配任意层级；
+# 含反斜杠的条目按相对根的路径前缀匹配。根目录自身永远返回 false。
+function Test-ExcludedPath([string]$root, [string]$path, [string[]]$excludes) {
+    if (-not $excludes -or $excludes.Count -eq 0) { return $false }
+    $rootKey = $root.TrimEnd('\')
+    $pathKey = $path.TrimEnd('\')
+    if ($pathKey.Length -le $rootKey.Length) { return $false }
+    if (-not $pathKey.StartsWith($rootKey, [System.StringComparison]::OrdinalIgnoreCase)) { return $false }
+    $relative = $pathKey.Substring($rootKey.Length).TrimStart('\').ToLowerInvariant()
+    foreach ($exclude in $excludes) {
+        if ($exclude.Contains('\')) {
+            if ($relative -eq $exclude -or $relative.StartsWith($exclude + '\')) { return $true }
+        } else {
+            foreach ($segment in ($relative -split '\\')) {
+                if ($segment -eq $exclude) { return $true }
+            }
+        }
+    }
+    return $false
+}
+
 function Test-FileCandidate([string]$p, [bool]$allFiles) {
     if ($allFiles) { return $true }
     $ext = [System.IO.Path]::GetExtension($p).ToLowerInvariant()
@@ -677,10 +717,11 @@ function Add-ObjectHit($hits, $info) {
     return $false
 }
 
-function Invoke-Scan([string]$root, [bool]$allFiles, [int]$maxObjects) {
+function Invoke-Scan([string]$root, [bool]$allFiles, [int]$maxObjects, [string[]]$excludes = @()) {
     $hits = New-Object System.Collections.ArrayList
     $unreadable = New-Object System.Collections.ArrayList
     $daclUnreadable = New-Object System.Collections.ArrayList
+    $excluded = New-Object System.Collections.ArrayList
     $errors = New-Object System.Collections.ArrayList
     $dirs = 0
     $files = 0
@@ -703,6 +744,11 @@ function Invoke-Scan([string]$root, [bool]$allFiles, [int]$maxObjects) {
                 if ($script:Count -ge $maxObjects) { $script:Truncated = $true; break }
                 $childNative = ConvertFrom-LongPath $child
                 if ((Test-Skip $child) -or (Test-Reparse $child)) { continue }
+                # 排除目录不计数、不入命中，只记录数量与样本，供结果与记录说明。
+                if (Test-ExcludedPath $root $childNative $excludes) {
+                    [void]$excluded.Add($childNative)
+                    continue
+                }
                 $script:Count++
                 $dirs++
                 $info = Get-Info $childNative
@@ -714,9 +760,14 @@ function Invoke-Scan([string]$root, [bool]$allFiles, [int]$maxObjects) {
             foreach ($file in [System.IO.Directory]::EnumerateFiles($dir)) {
                 if ($script:Count -ge $maxObjects) { $script:Truncated = $true; break }
                 if (-not (Test-FileCandidate $file $allFiles)) { continue }
+                $fileNative = ConvertFrom-LongPath $file
+                if (Test-ExcludedPath $root $fileNative $excludes) {
+                    [void]$excluded.Add($fileNative)
+                    continue
+                }
                 $script:Count++
                 $files++
-                $info = Get-Info (ConvertFrom-LongPath $file)
+                $info = Get-Info $fileNative
                 if (-not $info.readable) { [void]$unreadable.Add($info) }
                 else { [void](Add-ObjectHit $hits $info) }
                 if (-not $info.daclReadable) { [void]$daclUnreadable.Add($info) }
@@ -744,6 +795,8 @@ function Invoke-Scan([string]$root, [bool]$allFiles, [int]$maxObjects) {
         unreadableSamples = @($unreadable | Select-Object -First 20 | ForEach-Object { $_.path })
         daclUnreadable = [int]$daclUnreadable.Count
         daclUnreadableSamples = @($daclUnreadable | Select-Object -First 20 | ForEach-Object { $_.path })
+        excluded = [int]$excluded.Count
+        excludedSamples = @($excluded | Select-Object -First 20)
         hits = @($hits)
         errors = @($errors)
         truncated = [bool]$script:Truncated
@@ -774,7 +827,7 @@ function Save-ObjectDacl([string]$recordDir, [string]$objectPath) {
     return [pscustomobject]@{ path = $objectPath; file = $file }
 }
 
-function New-BackupRecord([string]$root, $scan, [bool]$requestedRemoveAces, [bool]$effectiveRemoveAces, [bool]$fast, [string]$trigger) {
+function New-BackupRecord([string]$root, $scan, [bool]$requestedRemoveAces, [bool]$effectiveRemoveAces, [bool]$fast, [string]$trigger, [string[]]$excludes = @()) {
     $base = Get-BackupRoot
     $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
     $dir = Join-Path $base ("backup-" + $stamp + "-" + [guid]::NewGuid().ToString('N').Substring(0, 6))
@@ -798,6 +851,10 @@ function New-BackupRecord([string]$root, $scan, [bool]$requestedRemoveAces, [boo
         removeAces = $effectiveRemoveAces
         fast = $fast
         trigger = $trigger
+        # 记录本次排除范围与数量：被跳过的目录必须可见，不能当成已修复。
+        excludeDirs = @($excludes)
+        excluded = [int]$scan.excluded
+        excludedSamples = @($scan.excludedSamples)
         truncated = [bool]$scan.truncated
         removedAces = 0
         acesSkipped = ($requestedRemoveAces -and -not $effectiveRemoveAces)
@@ -826,10 +883,9 @@ function Update-BackupManifest([string]$dir, [hashtable]$patch) {
     }
 }
 
-function Invoke-Fix([string]$root, [bool]$removeAces, [bool]$allFiles, [bool]$fast, [int]$maxObjects, [string]$trigger = 'manual') {
+function Invoke-Fix([string]$root, [bool]$removeAces, [bool]$allFiles, [bool]$fast, [int]$maxObjects, [string]$trigger = 'manual', [string[]]$excludes = @()) {
     $requestedRemoveAces = $removeAces
-    # -Fast never pre-scans, so it cannot find ACEs to delete. Refuse the
-    # combination instead of silently doing nothing.
+    # -Fast 不预扫，无法找到可删的 ACE；直接拒绝该组合，避免静默空转。
     if ($fast -and $removeAces) {
         throw "-Fast and -RemoveAces cannot be combined: a fast run does not pre-scan, so it cannot find ACEs to remove. Omit -Fast for a full repair."
     }
@@ -841,8 +897,9 @@ function Invoke-Fix([string]$root, [bool]$removeAces, [bool]$allFiles, [bool]$fa
         if ($removeAces) {
             [void]$plan.Add('aces: remove explicit DSH sandbox grants and the ambient delete deny from scanned hits')
         }
-        $scan = Invoke-Scan $root $allFiles $maxObjects
+        $scan = Invoke-Scan $root $allFiles $maxObjects $excludes
         if ($scan.truncated) { [void]$plan.Add('scan: would be truncated at MaxObjects') }
+        if ($scan.excluded -gt 0) { [void]$plan.Add("excluded directories: $($scan.excluded)") }
         [void]$plan.Add("hits: $($scan.hits.Count), low: $($scan.low), sandboxSid: $($scan.sandboxSid), everyoneDeny: $($scan.everyoneDeny)")
         return [pscustomobject]@{
             ok = $true
@@ -856,6 +913,8 @@ function Invoke-Fix([string]$root, [bool]$removeAces, [bool]$allFiles, [bool]$fa
             everyoneDeny = [int]$scan.everyoneDeny
             unreadable = [int]$scan.unreadable
             daclUnreadable = [int]$scan.daclUnreadable
+            excluded = [int]$scan.excluded
+            excludedSamples = @($scan.excludedSamples)
             truncated = [bool]$scan.truncated
             requestedRemoveAces = $removeAces
             removedAces = 0
@@ -886,6 +945,8 @@ function Invoke-Fix([string]$root, [bool]$removeAces, [bool]$allFiles, [bool]$fa
                 everyoneDeny = 0
                 unreadable = 0
                 daclUnreadable = 0
+                excluded = $null
+                excludedSamples = @()
                 truncated = $false
                 requestedRemoveAces = $requestedRemoveAces
                 removedAces = 0
@@ -902,14 +963,15 @@ function Invoke-Fix([string]$root, [bool]$removeAces, [bool]$allFiles, [bool]$fa
 
     $scan = $null
     if (-not $fast) {
-        $scan = Invoke-Scan $root $allFiles $maxObjects
+        $scan = Invoke-Scan $root $allFiles $maxObjects $excludes
     } else {
         $scan = [pscustomobject]@{
-            hits = @(); low = 0; sandboxSid = 0; everyoneDeny = 0; unreadable = 0; daclUnreadable = 0; truncated = $false
+            hits = @(); low = 0; sandboxSid = 0; everyoneDeny = 0; unreadable = 0; daclUnreadable = 0
+            excluded = 0; excludedSamples = @(); truncated = $false
         }
     }
 
-    $record = New-BackupRecord $root $scan $requestedRemoveAces $removeAces $fast $trigger
+    $record = New-BackupRecord $root $scan $requestedRemoveAces $removeAces $fast $trigger $excludes
     $failed = New-Object System.Collections.ArrayList
     $objects = New-Object System.Collections.ArrayList
 
@@ -932,9 +994,10 @@ function Invoke-Fix([string]$root, [bool]$removeAces, [bool]$allFiles, [bool]$fa
             [void]$failed.Add(@{ path = $root; message = 'skipped ACE removal: the root label is still Low or unreadable' })
         } else {
             foreach ($hit in @($record.manifest.hits)) {
-                # Only explicit, removable hits; inherited entries are left to
-                # their parent and are reported separately.
+                # 只处理显式、可删除的命中；继承项留给父级，单独统计。
                 if (-not ($hit.sandboxSid -or $hit.everyoneDeny)) { continue }
+                # 防御：命中清单可能来自旧记录，排除目录不得删除。
+                if (Test-ExcludedPath $root $hit.path $excludes) { continue }
                 $saved = Save-ObjectDacl $record.dir $hit.path
                 if ($null -eq $saved) {
                     [void]$failed.Add(@{ path = $hit.path; message = 'could not save the object DACL; ACE removal skipped' })
@@ -952,7 +1015,7 @@ function Invoke-Fix([string]$root, [bool]$removeAces, [bool]$allFiles, [bool]$fa
 
     $verify = $null
     if (-not $fast) {
-        $verify = Invoke-Scan $root $allFiles $maxObjects
+        $verify = Invoke-Scan $root $allFiles $maxObjects $excludes
     } else {
         $rootInfo = Get-Info $root
         $verify = [pscustomobject]@{
@@ -961,6 +1024,7 @@ function Invoke-Fix([string]$root, [bool]$removeAces, [bool]$allFiles, [bool]$fa
             everyoneDeny = 0
             unreadable = 0
             daclUnreadable = 0
+            excluded = 0
             truncated = $false
         }
     }
@@ -970,13 +1034,18 @@ function Invoke-Fix([string]$root, [bool]$removeAces, [bool]$allFiles, [bool]$fa
     if ($ok -and -not $fast) {
         if ($verify.low -ne 0) { $ok = $false }
         if ($removeAces -and ($verify.sandboxSid -ne 0 -or $verify.everyoneDeny -ne 0)) { $ok = $false }
-        # A truncated scan cannot prove the tree is clean; never report success.
+        # 扫描被截断时无法证明整棵树干净，不允许报成功。
         if ($scan.truncated -or $verify.truncated) { $ok = $false }
     }
 
     $warning = $null
     if ($scan.truncated) {
         $warning = 'The scan was truncated at MaxObjects; the result covers only the scanned objects.'
+    }
+    if ($scan.excluded -gt 0) {
+        # 被排除的目录既未验证也未清理，必须显式提示，避免误判成已修复。
+        $excludedWarning = "$($scan.excluded) directories were excluded from the scan; they were not verified or cleaned"
+        $warning = if ($warning) { $warning + ' ' + $excludedWarning } else { $excludedWarning }
     }
 
     $note = $null
@@ -996,6 +1065,8 @@ function Invoke-Fix([string]$root, [bool]$removeAces, [bool]$allFiles, [bool]$fa
         objects = @($objects)
         failed = @($failed)
         truncated = [bool]$scan.truncated
+        excluded = [int]$scan.excluded
+        excludedSamples = @($scan.excludedSamples)
         ok = $ok
         verifyLow = [int]$verify.low
         verifySandboxSid = [int]$verify.sandboxSid
@@ -1015,6 +1086,8 @@ function Invoke-Fix([string]$root, [bool]$removeAces, [bool]$allFiles, [bool]$fa
         everyoneDeny = [int]$verify.everyoneDeny
         unreadable = [int]$verify.unreadable
         daclUnreadable = [int]$verify.daclUnreadable
+        excluded = [int]$scan.excluded
+        excludedSamples = @($scan.excludedSamples)
         truncated = [bool]$scan.truncated
         requestedRemoveAces = $requestedRemoveAces
         removedAces = [int]$removed
@@ -1030,7 +1103,7 @@ function Invoke-Fix([string]$root, [bool]$removeAces, [bool]$allFiles, [bool]$fa
     }
 }
 
-function Invoke-Rollback([string]$dir) {
+function Invoke-Rollback([string]$dir, [string[]]$excludes = @()) {
     $manifestPath = Join-Path $dir 'manifest.json'
     if (-not (Test-Path -LiteralPath $manifestPath)) { throw "No manifest.json in $dir" }
     $manifest = Get-Content -LiteralPath $manifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
@@ -1072,7 +1145,8 @@ function Invoke-Rollback([string]$dir) {
     }
 
     $remaining = $null
-    try { $remaining = Invoke-Scan $root $false $MaxObjects } catch { }
+    # 复扫沿用同一排除清单，保证「剩余 Low」与修复时的范围一致。
+    try { $remaining = Invoke-Scan $root $false $MaxObjects $excludes } catch { }
 
     return [pscustomobject]@{
         ok = (@($failed).Count -eq 0)
@@ -1083,6 +1157,7 @@ function Invoke-Rollback([string]$dir) {
         daclRestored = $daclRestored
         objectsRestored = $objectsRestored
         remainingLow = $(if ($remaining) { [int]$remaining.low } else { $null })
+        excluded = $(if ($remaining) { [int]$remaining.excluded } else { $null })
         preScanned = $preScanned
         failed = @($failed)
         note = $(if ($preScanned) { $null } else { 'This record came from an automatic cleanup, which does not pre-scan: restored counts only the DACL and label actions it performed.' })
@@ -1109,12 +1184,16 @@ function Get-Records {
                 removedAces = $(if ($null -ne $manifest.removedAces) { [int]$manifest.removedAces } else { $null })
                 acesSkipped = [bool]$manifest.acesSkipped
                 truncated = [bool]$manifest.truncated
+                excluded = $(if ($null -ne $manifest.excluded) { [int]$manifest.excluded } else { $null })
                 ok = $(if ($null -ne $manifest.ok) { [bool]$manifest.ok } else { $null })
             })
         } catch { }
     }
     return @($items | Sort-Object { try { [datetime]::Parse([string]$_.createdAt) } catch { [datetime]::MinValue } } -Descending)
 }
+
+# 先把排除清单规范化一次，后续扫描、修复与回滚共用同一份范围。
+$excludes = ConvertTo-ExcludeList $ExcludeDirs
 
 try {
     switch ($Action) {
@@ -1131,7 +1210,7 @@ try {
             $danger = Test-DangerousRoot $root
             if ($danger -and -not $AllowDangerousRoot) { throw "Refusing to roll back $danger ($root). Pass -AllowDangerousRoot to override." }
             $lock = Enter-PathLock $root
-            try { $obj = Invoke-Rollback $BackupDir } finally { Exit-PathLock $lock }
+            try { $obj = Invoke-Rollback $BackupDir $excludes } finally { Exit-PathLock $lock }
         }
         default {
             if (-not $Path) { throw "$Action needs -Path" }
@@ -1146,7 +1225,7 @@ try {
                 if ($danger) { [Console]::Error.WriteLine("warning: modifying a dangerous root because -AllowDangerousRoot was passed: $root") }
             }
             if ($Action -eq 'scan') {
-                $scan = Invoke-Scan $root ([bool]$AllFiles) $MaxObjects
+                $scan = Invoke-Scan $root ([bool]$AllFiles) $MaxObjects $excludes
                 $obj = [ordered]@{
                     ok = $true
                     action = 'scan'
@@ -1162,16 +1241,20 @@ try {
                     unreadableSamples = $scan.unreadableSamples
                     daclUnreadable = $scan.daclUnreadable
                     daclUnreadableSamples = $scan.daclUnreadableSamples
+                    excluded = $scan.excluded
+                    excludedSamples = $scan.excludedSamples
                     truncated = $scan.truncated
                     errors = @($scan.errors | Select-Object -First 20)
+                    hitsTotal = $scan.hits.Count
                     hits = @($scan.hits | Select-Object -First 500)
                     failed = @()
                     elapsedMs = $scan.elapsedMs
                 }
             } elseif ($Action -eq 'verify') {
-                $scan = Invoke-Scan $root ([bool]$AllFiles) $MaxObjects
+                $scan = Invoke-Scan $root ([bool]$AllFiles) $MaxObjects $excludes
                 $obj = [ordered]@{
-                    ok = ($scan.low -eq 0 -and $scan.sandboxSid -eq 0 -and $scan.everyoneDeny -eq 0)
+                    # 截断时无法证明整棵树干净，verify 不报成功。
+                    ok = ($scan.low -eq 0 -and $scan.sandboxSid -eq 0 -and $scan.everyoneDeny -eq 0 -and -not $scan.truncated)
                     action = 'verify'
                     path = $root
                     low = $scan.low
@@ -1181,18 +1264,21 @@ try {
                     everyoneInherited = $scan.everyoneInherited
                     unreadable = $scan.unreadable
                     daclUnreadable = $scan.daclUnreadable
+                    excluded = $scan.excluded
+                    excludedSamples = $scan.excludedSamples
                     truncated = $scan.truncated
                     errors = @($scan.errors | Select-Object -First 20)
+                    hitsTotal = $scan.hits.Count
                     hits = @($scan.hits | Select-Object -First 500)
                     failed = @()
                     elapsedMs = $scan.elapsedMs
                 }
             } else {
                 if ($WhatIf) {
-                    $obj = Invoke-Fix $root ([bool]$RemoveAces) ([bool]$AllFiles) ([bool]$Fast) $MaxObjects $Trigger
+                    $obj = Invoke-Fix $root ([bool]$RemoveAces) ([bool]$AllFiles) ([bool]$Fast) $MaxObjects $Trigger $excludes
                 } else {
                     $lock = Enter-PathLock $root
-                    try { $obj = Invoke-Fix $root ([bool]$RemoveAces) ([bool]$AllFiles) ([bool]$Fast) $MaxObjects $Trigger }
+                    try { $obj = Invoke-Fix $root ([bool]$RemoveAces) ([bool]$AllFiles) ([bool]$Fast) $MaxObjects $Trigger $excludes }
                     finally { Exit-PathLock $lock }
                 }
             }

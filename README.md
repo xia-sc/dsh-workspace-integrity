@@ -32,6 +32,7 @@ Windows 专用的 DSH 插件包：修复 DSH `workspace-write` 沙箱遗留在�
 | 预演 | 工具 `whatIf: true` / 脚本 `-WhatIf`：只返回计划，不写记录、不改任何 ACL |
 | 对象 DACL 回滚 | `removeAces` 在删除前保存每个受影响对象的 DACL，回滚时逐对象恢复 |
 | 危险路径防护 | 拒绝盘根、`%SystemRoot%`、`%ProgramFiles%`、`%ProgramData%`、用户目录根；脚本侧同样拒绝 |
+| 扫描范围排除 | 默认跳过 `.git`/`.hg`/`.svn`，可按目录名或相对路径前缀配置；被排除目录在结果与记录中计数 |
 
 ## 安装
 
@@ -86,6 +87,7 @@ workspace_integrity action=rollback backupDir=C:\Users\me\AppData\Local\dsh-work
 | `path` | 绝对工作区路径；省略时取调用会话的当前工作区 |
 | `removeAces` | 同时删除非继承的 `S-1-4-*` ACE 与 Everyone 删除拒绝项；默认取插件配置 |
 | `allFiles` | 扫描所有文件，而不只是常见可执行扩展名 |
+| `excludeDirs` | 本次跳过的目录名（任意层级）或相对路径前缀数组；默认取插件配置 |
 | `fast` | 跳过预扫，只递归重置根标签；自动清理使用，**不会删除 ACE** |
 | `force` | 会话仍是 `workspace-write` 时强制修复；会让该会话失去工作区写权限且 DSH 不会恢复 |
 | `whatIf` | 只返回计划，不写回滚记录、不改 ACL |
@@ -109,6 +111,7 @@ workspace_integrity action=rollback backupDir=C:\Users\me\AppData\Local\dsh-work
         autoClean: true
         removeAces: false
         scanAllFiles: false
+        excludeDirs: ['.git', '.hg', '.svn']
 ```
 
 | 配置项 | 默认 | 说明 |
@@ -116,6 +119,7 @@ workspace_integrity action=rollback backupDir=C:\Users\me\AppData\Local\dsh-work
 | `autoClean` | `true` | 会话切到 `danger-full-access` 时自动清理当前工作区 |
 | `removeAces` | `false` | 修复时同时删除非继承的 `S-1-4-*` ACE 与 Everyone 删除拒绝项；会削弱仍在使用的沙箱 |
 | `scanAllFiles` | `false` | 扫描所有文件，而不是只扫描常见可执行扩展名 |
+| `excludeDirs` | `['.git', '.hg', '.svn']` | 跳过这些目录（按目录名匹配任意层级，或按相对根的路径前缀匹配）；根目录仍会检查 |
 
 面板会以这些值作为初始勾选状态，单次操作可以覆盖，但不会写回配置。
 
@@ -129,6 +133,8 @@ workspace_integrity action=rollback backupDir=C:\Users\me\AppData\Local\dsh-work
 - **失败即停**：标签恢复失败或根仍为 Low 时不会继续删除 ACE，并把 `acesSkipped` 写进结果与记录。
 - **复扫判定**：非 fast 修复只有在复扫 `low`、`sandboxSid`、`everyoneDeny` 都为 0 时才报成功；扫描截断也会判为未完成。
 - **记录诚实**：回滚记录写入 `requestedRemoveAces`/`removeAces`/`fast`/`trigger`/`truncated`/`removedAces`/`acesSkipped`/`ok`，删除前保存每个受影响对象的 DACL。
+- **扫描范围**：`excludeDirs` 在进入子树前生效，被排除目录不计数、不入命中、也不会被删除；scan/verify/fix 的结果与 manifest 记录 `excluded` 数量与前 20 条样本。根目录自身始终检查。
+- **截断与显示**：`MaxObjects` 只统计实际扫描对象；截断时 `truncated=true`，`verify`/`fix` 判为未完成。面板命中列表最多渲染 500 条，超出时提示「仅显示前 N 条」，与引擎截断区分。
 
 ## 已知限制
 
@@ -139,6 +145,7 @@ workspace_integrity action=rollback backupDir=C:\Users\me\AppData\Local\dsh-work
 - **`removeAces` 会改 DACL**：只删除符合 DSH 沙箱形状的显式 ACE（`S-1-4-x-y` / `S-1-4-x-y-1` allow，`GRANT_MASK`，OI|CI；Everyone 的 `FILE_DELETE_CHILD` deny，CI），继承项留给父级。删除前保存对象 DACL，回滚可恢复；仍可能让受限进程恢复删除工作区外文件的能力，只在确实要交还目录时使用。
 - **回滚记录**：保存根 DACL，并在删除 ACE 前保存每个受影响对象的 DACL；`rollback` 恢复两者并复扫 `remainingLow`。0.4.0 之前的旧记录没有对象 DACL，那些删除无法回滚。
 - **自动清理不会删 ACE**：自动路径固定 `removeAces: false`；即使配置开了 `removeAces`，fast 也不会删除，日志会说明。
+- **排除目录不会被清理**：`excludeDirs` 中的目录既不扫描也不删除，结果与记录用 `excluded` 标记；不要把「被跳过」当成「已修复」。
 - **截断与失败**：`MaxObjects` 截断时结果标记 `truncated` 且 `ok=false`，只修复已扫描对象；标签恢复失败、根仍 Low、DACL 不可读都会让本次修复不报成功。
 - **危险路径**：盘根、`%SystemRoot%`、`%ProgramFiles%`、`%ProgramData%`、用户目录根默认拒绝；脚本侧只有显式 `-AllowDangerousRoot` 才能越过。
 - **编码**：脚本保存为 UTF-8 with BOM，并去除了依赖本地代码页的中文文本匹配；`icacls` 失败只按退出码判断。

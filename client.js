@@ -68,6 +68,7 @@ window.__ModuleLoader__.load({
         statusLow: '发现 {count} 个 Low 对象',
         statusFixed: '已恢复为 Medium',
         statusWhatIf: '预演（未修改）',
+        statusTruncated: '结果不完整（已截断）',
         statusSkipped: '未改动',
         statusRolledBack: '已回滚：标签恢复为 Low',
         statusFailed: '修复未完成',
@@ -83,6 +84,7 @@ window.__ModuleLoader__.load({
         truncated: '结果已截断',
         elapsed: '耗时',
         hits: '命中的对象',
+        hitsLimited: '仅显示前 {count} 条（共 {total} 条）',
         plan: '计划',
         noHits: '没有发现 Low 标签或残留的沙箱权限项。',
         backup: '回滚目录',
@@ -91,6 +93,9 @@ window.__ModuleLoader__.load({
         root: '工作区',
         noRecords: '暂无回滚记录。',
         backupRoot: '回滚记录目录',
+        excludeDirs: '排除目录',
+        excluded: '已排除目录',
+        none: '无',
         recordAuto: '自动清理（未预扫）',
         autoClean: '当前会话切到完全权限时自动清理',
         on: '开',
@@ -149,6 +154,7 @@ window.__ModuleLoader__.load({
         statusLow: '{count} Low objects',
         statusFixed: 'Restored to Medium',
         statusWhatIf: 'What-if (no changes)',
+        statusTruncated: 'Incomplete result (truncated)',
         statusSkipped: 'No change',
         statusRolledBack: 'Rolled back: labels are Low again',
         statusFailed: 'Repair incomplete',
@@ -164,6 +170,7 @@ window.__ModuleLoader__.load({
         truncated: 'Results truncated',
         elapsed: 'Elapsed',
         hits: 'Matching objects',
+        hitsLimited: 'Showing the first {count} of {total}',
         plan: 'Plan',
         noHits: 'No Low labels or leftover sandbox entries were found.',
         backup: 'Rollback directory',
@@ -172,6 +179,9 @@ window.__ModuleLoader__.load({
         root: 'Workspace',
         noRecords: 'No rollback records yet.',
         backupRoot: 'Rollback records',
+        excludeDirs: 'Excluded dirs',
+        excluded: 'Excluded directories',
+        none: 'none',
         recordAuto: 'Auto-cleaned (not pre-scanned)',
         autoClean: 'Clean automatically when the session switches to full access',
         on: 'on',
@@ -364,6 +374,7 @@ window.__ModuleLoader__.load({
         return { text: t('statusRolledBack'), tone: 'warn' }
       }
       const low = typeof data.low === 'number' ? data.low : 0
+      if (data.truncated === true) return { text: t('statusTruncated'), tone: 'warn' }
       return low > 0
         ? { text: t('statusLow', { count: low }), tone: 'warn' }
         : { text: t('statusClean'), tone: 'ok' }
@@ -390,12 +401,17 @@ window.__ModuleLoader__.load({
       }
     }
 
+    // 命中列表的渲染上限。它与引擎的 MaxObjects 截断无关：引擎截断由
+    // data.truncated 表示，这里只限制页面一次渲染多少条。
+    const MAX_RENDERED_HITS = 500
+
     function Hits(props) {
-      const { hits, t } = props
+      const { hits, t, total } = props
       const all = Array.isArray(hits) ? hits : []
-      const shown = all.slice(0, 60)
+      const shown = all.slice(0, MAX_RENDERED_HITS)
       if (shown.length === 0) return h('p', { className: 'dshwi-empty' }, t('noHits'))
-      const count = all.length > shown.length ? shown.length + '/' + all.length : String(all.length)
+      const totalCount = typeof total === 'number' && total > all.length ? total : all.length
+      const count = totalCount > shown.length ? shown.length + '/' + totalCount : String(totalCount)
       return h('div', { className: 'dshwi-records' },
         h('span', { className: 'dshwi-label' }, t('hits') + ' · ' + count),
         h('ul', { className: 'dshwi-list' }, shown.map(function (hit, index) {
@@ -407,8 +423,8 @@ window.__ModuleLoader__.load({
               entry.sandboxSid ? tag(null, t('onlySid')) : null,
               entry.everyoneDeny ? tag('bad', t('onlyDeny')) : null))
         })),
-        all.length > shown.length
-          ? h('p', { className: 'dshwi-note' }, t('truncated'))
+        totalCount > shown.length
+          ? h('p', { className: 'dshwi-note' }, t('hitsLimited', { count: shown.length, total: totalCount }))
           : null)
     }
 
@@ -423,6 +439,7 @@ window.__ModuleLoader__.load({
         chips.push(chip('bad', t('daclUnreadable'), data.daclUnreadable))
       }
       if (typeof data.removedAces === 'number') chips.push(chip('', t('removedAces'), data.removedAces))
+      if (typeof data.excluded === 'number' && data.excluded > 0) chips.push(chip('', t('excluded'), data.excluded))
       if (data.acesSkipped === true) chips.push(chip('warn', '', t('acesSkipped')))
       if (data.rootOnly === true) chips.push(chip('', '', t('rootOnly')))
       if (typeof data.objectsRestored === 'number') {
@@ -468,7 +485,7 @@ window.__ModuleLoader__.load({
               ? h('p', { className: 'dshwi-note' }, t('truncated'))
               : null)
           : null,
-        scanLike && Array.isArray(data.hits) ? h(Hits, { hits: data.hits, t }) : null)
+        scanLike && Array.isArray(data.hits) ? h(Hits, { hits: data.hits, total: data.hitsTotal, t }) : null)
     }
 
     function createView(t, locale) {
@@ -811,7 +828,12 @@ window.__ModuleLoader__.load({
           ? h('p', { className: 'dshwi-note' },
             t('backupRoot') + ' · ' + String(state.backupRoot),
             ' · ',
-            t('autoClean') + ' · ' + (state.config && state.config.autoClean ? t('on') : t('off')))
+            t('autoClean') + ' · ' + (state.config && state.config.autoClean ? t('on') : t('off')),
+            ' · ',
+            t('excludeDirs') + ' · ' + (
+              state.config && Array.isArray(state.config.excludeDirs) && state.config.excludeDirs.length > 0
+                ? state.config.excludeDirs.join(', ')
+                : t('none')))
           : null,
 
         error ? h('p', { className: 'dshwi-error', role: 'alert' }, error) : null,

@@ -37,13 +37,17 @@ Windows 上使用 DSH 的 `workspace-write` 沙箱后，工作区根目录会被
 
 扫描把「显式项」与「继承项」分开计数（`sandboxSid` / `sandboxInherited` / `everyoneDeny` / `everyoneInherited`），继承项不会被删除。默认扫描目录和常见可执行文件；`allFiles: true` 扫描所有文件。
 
+目录排除由 `-ExcludeDirs`（宿主配置 `excludeDirs`，默认 `.git`、`.hg`、`.svn`）控制：不含反斜杠的条目按目录名匹配任意层级，含反斜杠的条目按相对根的路径前缀匹配。排除在进入子树前生效，被排除目录不计数、不入命中、也不会被删除；结果用 `excluded` 数量与 `excludedSamples`（前 20 条）体现。根目录自身始终检查。
+
+结果里的 `hits` 是前 500 条命中，`hitsTotal` 是全部命中数；面板最多渲染 500 条，超出时提示「仅显示前 N 条」，这与引擎因 `MaxObjects` 截断产生的 `truncated` 是两件事。
+
 读不到 SACL 的对象计入 `unreadable`，读不到 DACL 的对象计入 `daclUnreadable`；两者都不会被误报成「没有残留」。目录遍历失败会出现在 `errors` 里。
 
 ## 修复
 
 `fix` 的执行顺序（幂等：根标签已经是 Medium 且没有勾选「同时移除沙箱残留权限项」时，直接返回「未改动」，不预扫、不写回滚记录、不遍历全树）：
 
-1. 保存回滚记录：根目录的 owner+DACL SDDL、根标签状态、命中的对象列表、是否预扫（`fast`）、来源（`trigger`）、是否截断（`truncated`）；`sddlSaved` 记录根 DACL 是否保存成功；
+1. 保存回滚记录：根目录的 owner+DACL SDDL、根标签状态、命中的对象列表、是否预扫（`fast`）、来源（`trigger`）、是否截断（`truncated`）、排除清单与数量（`excludeDirs` / `excluded` / `excludedSamples`）；`sddlSaved` 记录根 DACL 是否保存成功；
 2. 对根目录执行递归标签恢复，把整棵树（包括 `bin`、`dist`、`node_modules` 等）设为 Medium；
 3. 如果当前账户对该目录没有 `WRITE_OWNER`，通过 `WRITE_DAC` 临时授予自己完全控制，改完标签后按保存的 SDDL 还原 DACL（还原放在 `finally` 中，异常时也会执行）；
 4. 只有标签恢复成功且根已不是 Low 时，才执行第 5 步；否则标记 `acesSkipped` 并跳过删除；
@@ -54,7 +58,7 @@ Windows 上使用 DSH 的 `workspace-write` 沙箱后，工作区根目录会被
 
 `-WhatIf`（工具 `whatIf: true`）只返回计划（`plan`），不写记录、不改 ACL。
 
-`verify` 只复扫，不修改。`rollback` 按记录恢复根 DACL、逐个恢复 `objects/` 中保存的对象 DACL，并把记录中原本为 Low 的对象重新设为 Low；结果给出 `restored`（实际恢复动作数）、`daclRestored`、`objectsRestored`、`remainingLow`。`records` 列出来源、是否预扫、`removedAces`、`acesSkipped`、`truncated` 与 `ok`。
+`verify` 只复扫，不修改。`rollback` 按记录恢复根 DACL、逐个恢复 `objects/` 中保存的对象 DACL，并把记录中原本为 Low 的对象重新设为 Low；结果给出 `restored`（实际恢复动作数）、`daclRestored`、`objectsRestored`、`remainingLow`、`excluded`。`records` 列出来源、是否预扫、`removedAces`、`acesSkipped`、`truncated` 与 `ok`。
 
 ## 限制
 
@@ -66,7 +70,8 @@ Windows 上使用 DSH 的 `workspace-write` 沙箱后，工作区根目录会被
 - 自动清理与手动修复共用同一套幂等判断：根非 Low 且不要求删 ACE 时都直接跳过，所以重复点击不会产生空转和记录堆积；fast 与删 ACE 无法同时满足，组合会被拒绝。
 - 清理冷却（60 秒）持久化在 `%DSH_HOME%\workspace-integrity.state.json`：插件重装或 HMR 重挂载后，已经清理过的会话不会立刻再触发一轮检查。
 - 幂等跳过只看根标签：如果上一次清理中途失败、根已经是 Medium 但子对象仍是 Low，`fix` 会跳过。先用「校验」确认残留，再用一次**非 fast** 的 `removeAces: true` 修复（没有 ACE 可删时不会误删），或用管理员 shell 对子树执行 `icacls <path> /setintegritylevel (OI)(CI)M /T /C`。
-- 扫描/复扫按 `MaxObjects` 截断：截断会标记 `truncated` 且 `ok=false`，只修复已扫描对象，不会假装完成。
+- 扫描/复扫按 `MaxObjects` 截断：截断会标记 `truncated`，`verify` 与 `fix` 判为未完成（`ok=false`），只修复已扫描对象，不会假装完成；面板命中列表只渲染前 500 条时另有「仅显示前 N 条」提示，不代表引擎截断。
+- 排除目录不会被清理：`excludeDirs` 中的目录既不扫描也不删除，结果与记录用 `excluded` 标记；不要把它当成「已修复」。排除只影响子树，根目录的标签与 DACL 仍会检查。
 - `removeAces` 会改 DACL，并可能让受限进程恢复删除工作区外文件的能力；只在确实需要交还目录时使用。删除前会保存对象 DACL，回滚可恢复；0.4.0 之前的旧记录没有对象 DACL，那些删除不可回滚。
 - 回滚记录保存根 DACL 与受影响对象的 DACL，不保存每个对象的完整 SACL；子对象上的其他显式标签不会被精确还原。
 - 文件编码为 UTF-8 with BOM；脚本不再用本地化的错误文本判断失败，只依据退出码与复扫结果。

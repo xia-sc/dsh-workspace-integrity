@@ -1,6 +1,6 @@
 # @xia-sc/dsh-workspace-integrity 风险清单
 
-针对 `@xia-sc/dsh-workspace-integrity` **0.3.2** 的复核结果，供后续逐条修复；当前已核到 0.4.0。0.3.5 之后只做包名迁移（旧作用域 → `@xia-sc`）、中文文档与发布流水线，行为未变；0.3.6 仅用于验证 npm OIDC 发布；0.4.0 处理 `Repair.ps1` 的只读审计问题（见文末对照表），修复引擎行为有变化。
+针对 `@xia-sc/dsh-workspace-integrity` **0.3.2** 的复核结果，供后续逐条修复；当前已核到 0.4.1。0.3.5 之后只做包名迁移（旧作用域 → `@xia-sc`）、中文文档与发布流水线，行为未变；0.3.6 仅用于验证 npm OIDC 发布；0.4.0 处理 `Repair.ps1` 的只读审计问题（见文末对照表）；0.4.1 增加目录排除、修正截断判定与命中列表显示（不影响已发布版本）。
 
 - 复核对象：自动清理注册处、`index.js`、`scripts/Repair.ps1`、`routes.js`、`client.js`。
 - 复核基准：0.3.3 已修复风险 1、2（跨进程锁 + 宿主模式门禁）；0.3.4 已修复风险 3、4、5（修复幂等、记录标注 `fast`/`trigger`、自动路径跟随 `working_directory`）；0.3.5 已修复风险 6、7、8（面板显示上次清理、自动路径共用 `operations.fix`、冷却持久化 + `WeakSet`）。
