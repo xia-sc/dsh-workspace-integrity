@@ -684,8 +684,7 @@ export function apply(ctx, rawConfig = {}) {
   })
 
   if (!IS_WIN || config.autoClean === false) return
-  // Keyed by the Session object, not its id: no strings accumulate over a long
-  // run, and the entry goes away with the Session it describes.
+  // 以 Session 对象为键，而不是 id：长期运行不会累积字符串，条目随会话回收。
   const seen = new WeakSet()
   const modeOf = (session) => {
     try {
@@ -699,14 +698,18 @@ export function apply(ctx, rawConfig = {}) {
     if (!root) return
     if (modeOf(session) !== 'danger-full-access') return
     log(`${why}: full access on ${root}`)
-    void autoClean(ctx, operations, session)
+    // config 只存在于 apply 作用域，必须在这里读取并传入 autoClean；
+    // 同时兜底拒绝，避免自动清理的异常逃逸成宿主的未处理拒绝。
+    void autoClean(ctx, operations, session, { removeAces: config.removeAces }).catch((error) => {
+      log(`clean failed for ${root}: ${String(error && error.message || error)}`)
+    })
   }
   ctx.on('session/event', (session, event) => {
     if (event?.type === 'sandbox/mode') {
       if (event?.data?.mode === 'danger-full-access') maybeClean(session, 'sandbox/mode')
       return
     }
-    // A hot mount can meet a session that is already on full access; check once.
+    // 热挂载可能遇到已经处于完全权限的会话：每个会话只检查一次。
     if (!session || session.id === undefined) return
     if (seen.has(session)) return
     seen.add(session)
@@ -714,11 +717,10 @@ export function apply(ctx, rawConfig = {}) {
   })
 }
 
-/** Clean a workspace after its session switched to full access. */
-async function autoClean(ctx, operations, session) {
-  // Same directory the panel shows and the tool defaults to: a Session that
-  // changed directory with `working_directory` must not have its launch
-  // directory cleaned instead.
+/** 会话切到完全权限后清理其工作区。 */
+async function autoClean(ctx, operations, session, options = {}) {
+  // 与面板、工具使用同一个目录：用 working_directory 改过目录的会话，
+  // 不能去清理它启动时的目录。
   const root = sessionWorkspace(ctx, session)
   if (typeof root !== 'string' || !root) {
     log('full-access event without a workspace path; skipped')
@@ -726,19 +728,16 @@ async function autoClean(ctx, operations, session) {
   }
   const now = Date.now()
   if (now - (lastRun.get(root) || 0) < COOLDOWN_MS) return
-  // Record the attempt before running: a failed cleanup still counts as the
-  // cooldown, exactly like the panel's own retry behaviour.
+  // 先记录本次尝试：失败的清理同样计入冷却，与面板的重试行为一致。
   lastRun.set(root, now)
   persistCooldowns()
   log(`full access detected: cleaning ${root}`)
-  if (config.removeAces) {
+  if (options.removeAces) {
     log('automatic cleanup uses fast mode and does not remove ACEs; run a full repair to remove them')
   }
   try {
-    // One implementation for every caller: the automatic path goes through the
-    // same operation as the panel and the tool. It pins `removeAces: false`
-    // because fast mode cannot pre-scan for ACEs; an explicit full repair is
-    // the only path that deletes them.
+    // 三个入口共用同一份实现：自动路径也走 operations.fix。这里固定
+    // removeAces: false——fast 不预扫，只有显式全量修复才会删除 ACE。
     const result = await operations.fix({
       path: root,
       fast: true,
@@ -753,7 +752,7 @@ async function autoClean(ctx, operations, session) {
     if (result?.warning) log(`clean warning for ${root}: ${result.warning}`)
   } catch (error) {
     const message = String(error?.message || error)
-    // A 400 is the shared lock or the mode gate, not a failure of this run.
+    // 400 表示共享锁或模式门禁，不是本次清理失败。
     if (error?.status === 400) log(`clean skipped for ${root}: ${message}`)
     else log(`clean failed for ${root}: ${message}`)
   }
