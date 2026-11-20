@@ -1,4 +1,4 @@
-param(
+﻿param(
     [ValidateSet('scan', 'fix', 'verify', 'rollback', 'records')]
     [string]$Action = 'scan',
 
