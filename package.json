@@ -1,6 +1,6 @@
 {
   "name": "@xia-sc/dsh-workspace-integrity",
-  "version": "0.3.5",
+  "version": "0.3.6",
   "description": "在 Windows 上修复 DSH workspace-write 沙箱遗留在工作区上的 Low 完整性标签，附带完整性面板、agent 工具、回滚记录与自动清理。",
   "license": "MIT",
   "author": "xia-sc",
