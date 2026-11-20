@@ -38,9 +38,8 @@ jobs:
         with:
           node-version: '24'
 
-      - name: Ensure a trusted-publishing capable npm
+      - name: Show npm version
         run: |
-          npm install -g npm@latest
           node --version
           npm --version
 
