@@ -1,8 +1,8 @@
 import { execFile } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import {
-  appendFileSync, closeSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, statSync, unlinkSync,
-  writeFileSync, writeSync,
+  appendFileSync, closeSync, existsSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, statSync,
+  unlinkSync, writeFileSync, writeSync,
 } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, isAbsolute, join, resolve } from 'node:path'
@@ -208,6 +208,47 @@ function normalizeRoot(input) {
   return root
 }
 
+/**
+ * Refuse roots whose recursive repair would rewrite the machine: a drive root,
+ * a protected system directory, or the profile root. The engine repeats this
+ * check, so a direct script run cannot bypass it either.
+ * @param root - the normalized workspace path a repair is about to touch.
+ */
+function assertSafeRoot(root) {
+  const full = resolve(root)
+  if (/^[a-zA-Z]:\\?$/.test(full)) throw userError(`Refusing a drive root: ${root}`)
+  const protectedDirs = []
+  for (const key of ['SystemRoot', 'ProgramFiles', 'ProgramData']) {
+    const value = process.env[key]
+    if (value) protectedDirs.push(value)
+  }
+  const x86 = process.env['ProgramFiles(x86)']
+  if (x86) protectedDirs.push(x86)
+  const lower = full.toLowerCase()
+  for (const dir of protectedDirs) {
+    const key = resolve(dir).toLowerCase()
+    if (lower === key || lower.startsWith(key + '\\')) {
+      throw userError(`Refusing a protected system directory: ${root}`)
+    }
+  }
+  const profile = process.env.USERPROFILE
+  if (profile && lower === resolve(profile).toLowerCase()) throw userError(`Refusing the user profile root: ${root}`)
+  const drive = process.env.SystemDrive
+  if (drive) {
+    const usersRoot = resolve(join(drive + '\\', 'Users')).toLowerCase()
+    if (lower === usersRoot) throw userError(`Refusing the Users root: ${root}`)
+  }
+}
+
+/** A reparse-point root would repair whatever it targets, not the path shown. */
+function assertNotReparse(root) {
+  try {
+    if (lstatSync(root).isSymbolicLink()) throw userError(`Refusing a reparse-point root: ${root}`)
+  } catch (error) {
+    if (error?.status === 400) throw error
+  }
+}
+
 function wantsFlag(value, fallback) {
   if (value === true) return true
   if (value === false) return false
@@ -372,6 +413,8 @@ function createOperations(ctx, config) {
 
     async fix(input = {}) {
       const root = normalizeRoot(input.path)
+      assertSafeRoot(root)
+      assertNotReparse(root)
       // Host-side gate: the panel already asks twice, but a direct route call or
       // an agent tool call must not silently take a confined Session's write
       // access away. `force` is the explicit, informed override.
@@ -379,23 +422,25 @@ function createOperations(ctx, config) {
       if (mode === 'workspace-write' && input.force !== true) {
         throw userError('This session is workspace-write: repairing would take away its workspace write access and DSH does not restore it. Switch to full access, or pass force to repair anyway.')
       }
-      const removeAces = wantsFlag(input.removeAces, config.removeAces)
+      let removeAces = wantsFlag(input.removeAces, config.removeAces)
+      // `-Fast` never pre-scans, so it cannot find ACEs to delete; the engine
+      // rejects the combination. Degrade explicitly instead of failing the
+      // automatic path when config.removeAces is on.
+      const fastWithoutScan = input.fast === true && removeAces
+      if (fastWithoutScan) {
+        removeAces = false
+        log(`fast repair on ${root}: removeAces was requested but -Fast skips the pre-scan, so no ACE was removed`)
+      }
       const args = ['-Action', 'fix', '-Path', root, '-Json']
       args.push('-Trigger', TRIGGERS.includes(input.trigger) ? input.trigger : 'manual')
       if (removeAces) args.push('-RemoveAces')
       if (wantsFlag(input.allFiles, config.scanAllFiles)) args.push('-AllFiles')
       if (input.fast === true) args.push('-Fast')
-      // The automatic path passes config.removeAces through, but `-Fast` skips
-      // the pre-scan, so it cannot find ACEs to delete. Report that instead of
-      // letting the setting fail silently.
-      const fastWithoutScan = input.fast === true && removeAces
-      if (fastWithoutScan) {
-        log(`fast repair on ${root}: removeAces was requested but -Fast skips the pre-scan, so no leftover ACE was removed`)
-      }
+      if (input.whatIf === true) args.push('-WhatIf')
       const result = await withRootLock(root, () => run(args))
-      return fastWithoutScan
-        ? { ...result, warning: 'fast repair: the pre-scan was skipped, so no leftover ACE was removed; run a full repair to remove them' }
-        : result
+      if (!fastWithoutScan) return result
+      const warning = 'fast repair: the pre-scan was skipped, so no ACE was removed; run a full repair to remove them'
+      return { ...result, warning: result.warning ? `${result.warning} ${warning}` : warning }
     },
 
     async verify(input = {}) {
@@ -437,7 +482,12 @@ function summary(action, payload) {
   if (typeof payload.unreadable === 'number') lines.push(`unreadable objects: ${payload.unreadable}`)
   if (typeof payload.labelsFixed === 'number') lines.push(`labels changed: ${payload.labelsFixed}`)
   if (typeof payload.removedAces === 'number') lines.push(`ACEs removed: ${payload.removedAces}`)
+  if (payload.acesSkipped === true) lines.push('ACE removal skipped')
   if (typeof payload.restored === 'number') lines.push(`objects restored: ${payload.restored}`)
+  if (typeof payload.objectsRestored === 'number') lines.push(`object DACLs restored: ${payload.objectsRestored}`)
+  if (payload.remainingLow != null) lines.push(`remaining Low after rollback: ${payload.remainingLow}`)
+  if (payload.truncated === true) lines.push('truncated: yes')
+  if (payload.whatIf === true) lines.push('what-if: no changes were written')
   if (Array.isArray(payload.failed) && payload.failed.length > 0) {
     lines.push(`failures: ${payload.failed.length}`)
     for (const item of payload.failed.slice(0, 8)) lines.push(`- ${item.path}: ${item.message}`)
@@ -484,7 +534,7 @@ export function apply(ctx, rawConfig = {}) {
       },
       removeAces: {
         type: 'boolean',
-        description: 'Also delete non-inherited S-1-4 sandbox ACEs and the Everyone FILE_DELETE_CHILD deny. Defaults to the plugin config (false). Mutates DACLs and weakens a live sandbox; leave off unless you need a clean hand-back.',
+        description: 'Also delete explicit DSH sandbox grants (S-1-4-x-y / S-1-4-x-y-1 with the sandbox grant mask) and the Everyone FILE_DELETE_CHILD deny. Defaults to the plugin config (false). Mutates DACLs and weakens a live sandbox; each removed object DACL is recorded for rollback.',
       },
       allFiles: {
         type: 'boolean',
@@ -492,11 +542,15 @@ export function apply(ctx, rawConfig = {}) {
       },
       fast: {
         type: 'boolean',
-        description: 'Skip the pre-scan and only recursively reset the root label. Used by automatic cleanup.',
+        description: 'Skip the pre-scan and only recursively reset the root label. Used by automatic cleanup; it never removes ACEs.',
       },
       force: {
         type: 'boolean',
         description: 'Repair even when the calling session is still workspace-write. That takes the session\'s workspace write access away and DSH does not restore it, so pass it only when the session no longer needs to write.',
+      },
+      whatIf: {
+        type: 'boolean',
+        description: 'Return the planned fix without writing a rollback record or touching any ACL.',
       },
     },
     output: {
@@ -535,6 +589,7 @@ export function apply(ctx, rawConfig = {}) {
         allFiles: args.allFiles,
         fast: args.fast,
         force: args.force,
+        whatIf: args.whatIf,
         trigger: 'tool',
         sessionId: exec?.agent?.session?.id,
       }
@@ -633,13 +688,18 @@ async function autoClean(ctx, operations, session) {
   lastRun.set(root, now)
   persistCooldowns()
   log(`full access detected: cleaning ${root}`)
+  if (config.removeAces) {
+    log('automatic cleanup uses fast mode and does not remove ACEs; run a full repair to remove them')
+  }
   try {
     // One implementation for every caller: the automatic path goes through the
-    // same operation as the panel and the tool, so `config.removeAces` and
-    // `config.scanAllFiles` mean the same thing everywhere.
+    // same operation as the panel and the tool. It pins `removeAces: false`
+    // because fast mode cannot pre-scan for ACEs; an explicit full repair is
+    // the only path that deletes them.
     const result = await operations.fix({
       path: root,
       fast: true,
+      removeAces: false,
       trigger: 'auto',
       sessionId: session?.id,
     })

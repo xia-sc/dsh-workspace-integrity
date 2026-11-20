@@ -29,6 +29,9 @@ Windows 专用的 DSH 插件包：修复 DSH `workspace-write` 沙箱遗留在�
 | 并发保护 | 同一工作区在进程内与跨进程都只允许一个修复（独占锁文件） |
 | 状态可查 | 面板显示该工作区「上次清理」时间与来源，自动清理后不再显示「未扫描」 |
 | 冷却持久化 | 60 秒清理冷却写入 `%DSH_HOME%\workspace-integrity.state.json`，插件重载后不重复触发 |
+| 预演 | 工具 `whatIf: true` / 脚本 `-WhatIf`：只返回计划，不写记录、不改任何 ACL |
+| 对象 DACL 回滚 | `removeAces` 在删除前保存每个受影响对象的 DACL，回滚时逐对象恢复 |
+| 危险路径防护 | 拒绝盘根、`%SystemRoot%`、`%ProgramFiles%`、`%ProgramData%`、用户目录根；脚本侧同样拒绝 |
 
 ## 安装
 
@@ -83,8 +86,9 @@ workspace_integrity action=rollback backupDir=C:\Users\me\AppData\Local\dsh-work
 | `path` | 绝对工作区路径；省略时取调用会话的当前工作区 |
 | `removeAces` | 同时删除非继承的 `S-1-4-*` ACE 与 Everyone 删除拒绝项；默认取插件配置 |
 | `allFiles` | 扫描所有文件，而不只是常见可执行扩展名 |
-| `fast` | 跳过预扫，只递归重置根标签；自动清理使用 |
+| `fast` | 跳过预扫，只递归重置根标签；自动清理使用，**不会删除 ACE** |
 | `force` | 会话仍是 `workspace-write` 时强制修复；会让该会话失去工作区写权限且 DSH 不会恢复 |
+| `whatIf` | 只返回计划，不写回滚记录、不改 ACL |
 
 ### 回滚记录与状态文件
 
@@ -119,10 +123,12 @@ workspace_integrity action=rollback backupDir=C:\Users\me\AppData\Local\dsh-work
 
 - **自动清理**：监听 `sandbox/mode` 事件；根标签已是 Medium 时幂等跳过，不扫描、不写记录、不遍历整棵树。
 - **目录一致**：自动清理、面板、工具都通过同一个 `sessionWorkspace()` 取目录（`working_directory` 优先，回退会话启动目录）。
-- **幂等**：手动修复在「不删 ACE 且根非 Low」时直接返回「未改动」；`fast` 与删 ACE 无法同时满足，fast + `removeAces` 也会跳过并在结果里提示。
+- **幂等**：手动修复在「不删 ACE 且根非 Low」时直接返回「未改动」；`-Fast` 与 `-RemoveAces` 不能组合（fast 不预扫），脚本直接拒绝，宿主会把 fast 路径的 `removeAces` 显式降级并给出 warning。
 - **模式门禁**：`fix` 在调用方会话为 `workspace-write` 且未传 `force` 时被宿主拒绝，面板的「仍要修复」正是知情覆盖。
-- **锁**：`fix`、`rollback`、自动清理共用按工作区的锁（进程内 Map + 跨进程锁文件），后到者得到「已有修复在运行」。
-- **记录诚实**：回滚记录写入 `fast`（是否预扫）与 `trigger`（`auto` / `manual` / `tool`）；未预扫记录的 Low 数量是 `null`，回滚时说明 `restored` 只统计根 DACL 与标签恢复。
+- **锁**：`fix`、`rollback`、自动清理共用按工作区的锁（进程内 Map + 跨进程锁文件）；直接运行脚本时另有独立的 `.lock` 互斥。
+- **失败即停**：标签恢复失败或根仍为 Low 时不会继续删除 ACE，并把 `acesSkipped` 写进结果与记录。
+- **复扫判定**：非 fast 修复只有在复扫 `low`、`sandboxSid`、`everyoneDeny` 都为 0 时才报成功；扫描截断也会判为未完成。
+- **记录诚实**：回滚记录写入 `requestedRemoveAces`/`removeAces`/`fast`/`trigger`/`truncated`/`removedAces`/`acesSkipped`/`ok`，删除前保存每个受影响对象的 DACL。
 
 ## 已知限制
 
@@ -130,9 +136,12 @@ workspace_integrity action=rollback backupDir=C:\Users\me\AppData\Local\dsh-work
 - **不要在 `workspace-write` 会话仍在写工作区时修复**：沙箱内的 Low 令牌需要 Low 标签才能写，提前改成 Medium 会让该会话失去写权限；自动清理只在切到 `danger-full-access` 后触发。
 - **DSH 不会重新打标**：工作区授权按 provider 生命周期缓存，修复后继续用 `workspace-write` 的会话会一直写失败，直到重启 DSH 或换工作区。
 - **幂等跳过只看根标签**：如果上一次清理中途失败、根已是 Medium 但子对象仍是 Low，`fix` 会跳过；先用「校验」确认残留，再用一次非 fast 的 `removeAces: true` 修复，或用管理员 shell 对子树执行 `icacls <path> /setintegritylevel (OI)(CI)M /T /C`。
-- **`removeAces` 会改 DACL**：只删除非继承项，可能让受限进程恢复删除工作区外文件的能力；只在确实要交还目录时使用。
-- **回滚记录不是逐对象快照**：只保存根 DACL 与命中对象的标签，子对象上的其他显式标签不会被精确还原。
-- **自动清理不会删 ACE**：`-Fast` 不预扫，`removeAces` 在自动路径上不会生效，结果里会明确提示。
+- **`removeAces` 会改 DACL**：只删除符合 DSH 沙箱形状的显式 ACE（`S-1-4-x-y` / `S-1-4-x-y-1` allow，`GRANT_MASK`，OI|CI；Everyone 的 `FILE_DELETE_CHILD` deny，CI），继承项留给父级。删除前保存对象 DACL，回滚可恢复；仍可能让受限进程恢复删除工作区外文件的能力，只在确实要交还目录时使用。
+- **回滚记录**：保存根 DACL，并在删除 ACE 前保存每个受影响对象的 DACL；`rollback` 恢复两者并复扫 `remainingLow`。0.4.0 之前的旧记录没有对象 DACL，那些删除无法回滚。
+- **自动清理不会删 ACE**：自动路径固定 `removeAces: false`；即使配置开了 `removeAces`，fast 也不会删除，日志会说明。
+- **截断与失败**：`MaxObjects` 截断时结果标记 `truncated` 且 `ok=false`，只修复已扫描对象；标签恢复失败、根仍 Low、DACL 不可读都会让本次修复不报成功。
+- **危险路径**：盘根、`%SystemRoot%`、`%ProgramFiles%`、`%ProgramData%`、用户目录根默认拒绝；脚本侧只有显式 `-AllowDangerousRoot` 才能越过。
+- **编码**：脚本保存为 UTF-8 with BOM，并去除了依赖本地代码页的中文文本匹配；`icacls` 失败只按退出码判断。
 - **权限**：插件自身不提权，也不会关闭沙箱。
 
 ## 开发

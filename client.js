@@ -67,15 +67,23 @@ window.__ModuleLoader__.load({
         statusClean: '未发现 Low',
         statusLow: '发现 {count} 个 Low 对象',
         statusFixed: '已恢复为 Medium',
+        statusWhatIf: '预演（未修改）',
         statusSkipped: '未改动',
         statusRolledBack: '已回滚：标签恢复为 Low',
         statusFailed: '修复未完成',
         lowObjects: 'Low 对象',
         sidObjects: '沙箱权限项',
         unreadable: '无法读取',
+        daclUnreadable: 'DACL 不可读',
+        removedAces: '已删权限项',
+        acesSkipped: '未删权限项',
+        rootOnly: '仅验证根',
+        objectsRestored: '对象 DACL 已恢复',
+        remainingLow: '剩余 Low',
         truncated: '结果已截断',
         elapsed: '耗时',
         hits: '命中的对象',
+        plan: '计划',
         noHits: '没有发现 Low 标签或残留的沙箱权限项。',
         backup: '回滚目录',
         failed: '失败项',
@@ -140,15 +148,23 @@ window.__ModuleLoader__.load({
         statusClean: 'No Low objects',
         statusLow: '{count} Low objects',
         statusFixed: 'Restored to Medium',
+        statusWhatIf: 'What-if (no changes)',
         statusSkipped: 'No change',
         statusRolledBack: 'Rolled back: labels are Low again',
         statusFailed: 'Repair incomplete',
         lowObjects: 'Low objects',
         sidObjects: 'Sandbox entries',
         unreadable: 'Unreadable',
+        daclUnreadable: 'Unreadable DACLs',
+        removedAces: 'ACEs removed',
+        acesSkipped: 'ACEs skipped',
+        rootOnly: 'Root only',
+        objectsRestored: 'Object DACLs restored',
+        remainingLow: 'Remaining Low',
         truncated: 'Results truncated',
         elapsed: 'Elapsed',
         hits: 'Matching objects',
+        plan: 'Plan',
         noHits: 'No Low labels or leftover sandbox entries were found.',
         backup: 'Rollback directory',
         failed: 'Failures',
@@ -334,6 +350,7 @@ window.__ModuleLoader__.load({
       const failures = Array.isArray(data.failed) ? data.failed.length : 0
 
       if (result.kind === 'fix') {
+        if (data.whatIf === true) return { text: t('statusWhatIf'), tone: '' }
         // `ok: false` or a `note` means the engine changed nothing; never show
         // that as a green success.
         if (data.ok === false || failures > 0) return { text: t('statusFailed'), tone: 'bad' }
@@ -402,6 +419,18 @@ window.__ModuleLoader__.load({
       if (typeof data.low === 'number') chips.push(chip(data.low > 0 ? 'warn' : 'ok', t('lowObjects'), data.low))
       if (typeof data.sandboxSid === 'number') chips.push(chip(data.sandboxSid > 0 ? 'warn' : '', t('sidObjects'), data.sandboxSid))
       if (typeof data.unreadable === 'number') chips.push(chip(data.unreadable > 0 ? 'bad' : '', t('unreadable'), data.unreadable))
+      if (typeof data.daclUnreadable === 'number' && data.daclUnreadable > 0) {
+        chips.push(chip('bad', t('daclUnreadable'), data.daclUnreadable))
+      }
+      if (typeof data.removedAces === 'number') chips.push(chip('', t('removedAces'), data.removedAces))
+      if (data.acesSkipped === true) chips.push(chip('warn', '', t('acesSkipped')))
+      if (data.rootOnly === true) chips.push(chip('', '', t('rootOnly')))
+      if (typeof data.objectsRestored === 'number') {
+        chips.push(chip('', t('objectsRestored'), data.objectsRestored))
+      }
+      if (typeof data.remainingLow === 'number') {
+        chips.push(chip(data.remainingLow > 0 ? 'warn' : 'ok', t('remainingLow'), data.remainingLow))
+      }
       if (data.truncated === true) chips.push(chip('warn', '', t('truncated')))
       if (typeof data.elapsedMs === 'number') chips.push(chip('', t('elapsed'), Math.round(data.elapsedMs) + ' ms'))
 
@@ -419,6 +448,14 @@ window.__ModuleLoader__.load({
           : null,
         data.warning ? h('p', { className: 'dshwi-caution' }, String(data.warning)) : null,
         data.note ? h('p', { className: 'dshwi-note' }, String(data.note)) : null,
+        Array.isArray(data.plan) && data.plan.length > 0
+          ? h('div', { className: 'dshwi-records' },
+            h('span', { className: 'dshwi-label' }, t('plan')),
+            h('ul', { className: 'dshwi-list' }, data.plan.map(function (line, index) {
+              return h('li', { className: 'dshwi-item', key: index },
+                h('span', { className: 'dshwi-mono' }, String(line)))
+            })))
+          : null,
         failed.length > 0
           ? h('div', { className: 'dshwi-records' },
             h('span', { className: 'dshwi-label' }, t('failed') + ' · ' + failed.length),
@@ -797,7 +834,10 @@ window.__ModuleLoader__.load({
                     ? ' · ' + t('recordAuto')
                     : typeof record.low === 'number' && record.low > 0
                       ? ' · Low=' + record.low
-                      : ''),
+                      : '',
+                  typeof record.removedAces === 'number' && record.removedAces > 0
+                    ? ' · ACEs=' + record.removedAces
+                    : ''),
                 h('button', {
                   type: 'button',
                   className: 'dshwi-btn small danger' + (armed ? ' armed' : ''),

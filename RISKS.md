@@ -1,6 +1,6 @@
 # @xia-sc/dsh-workspace-integrity 风险清单
 
-针对 `@xia-sc/dsh-workspace-integrity` **0.3.2** 的复核结果，供后续逐条修复；当前已核到 0.3.6。0.3.5 之后只做包名迁移（旧作用域 → `@xia-sc`）、中文文档与发布流水线，行为未变；0.3.6 仅用于验证 npm OIDC 发布。
+针对 `@xia-sc/dsh-workspace-integrity` **0.3.2** 的复核结果，供后续逐条修复；当前已核到 0.4.0。0.3.5 之后只做包名迁移（旧作用域 → `@xia-sc`）、中文文档与发布流水线，行为未变；0.3.6 仅用于验证 npm OIDC 发布；0.4.0 处理 `Repair.ps1` 的只读审计问题（见文末对照表），修复引擎行为有变化。
 
 - 复核对象：自动清理注册处、`index.js`、`scripts/Repair.ps1`、`routes.js`、`client.js`。
 - 复核基准：0.3.3 已修复风险 1、2（跨进程锁 + 宿主模式门禁）；0.3.4 已修复风险 3、4、5（修复幂等、记录标注 `fast`/`trigger`、自动路径跟随 `working_directory`）；0.3.5 已修复风险 6、7、8（面板显示上次清理、自动路径共用 `operations.fix`、冷却持久化 + `WeakSet`）。
@@ -377,3 +377,29 @@
 | 0.3.5 | `state()` 返回 `lastClean`，面板显示「上次清理」（`index.js:265-296`、`357`、`client.js:709-712`） | 6 已修复 |
 | 0.3.5 | `autoClean` 走 `operations.fix`；fast + `-RemoveAces` 记日志并返回 `warning`（`index.js:640-651`、`382-397`、`scripts/Repair.ps1:563-590`） | 7 已修复 |
 | 0.3.5 | 冷却持久化 + `WeakSet`（`index.js:24-54`、`591`、`606-618`） | 8 已修复 |
+
+---
+
+## 附：0.4.0 审计修复对照
+
+2026-11-20 对 `scripts/Repair.ps1` 的只读审计（高/中/低清单）在 0.4.0 全部处理，行为变化见 `docs/DETAIL.md`。
+
+| 审计项 | 修复 |
+|---|---|
+| H1 标签失败后仍删 ACE | `Invoke-Fix` 删除前检查 `$runResult.ok` 与根状态，失败置 `acesSkipped` 并记 failed |
+| H2 删除子对象 ACE 不可回滚 | 删除前 `SaveDacl` 到 `backup-*/objects/`，`rollback` 逐个恢复；旧记录写明不可回滚 |
+| H3 ok 不校验残留 | 非 fast 的 `ok` 纳入复扫 `low`/`sandboxSid`/`everyoneDeny` 与 `truncated` |
+| H4 无危险路径防护 | 脚本 `Test-DangerousRoot`（含 `-AllowDangerousRoot`）+ 宿主 `assertSafeRoot`；文件/重解析点根拒绝 |
+| M1 fast+removeAces 语义 | 脚本拒绝组合；宿主降级为 `removeAces:false` + `warning`；自动清理固定不删 ACE |
+| M2 manifest 字段 | 写 `requestedRemoveAces`/`removeAces`/`truncated`/`removedAces`/`acesSkipped`/`objects`/`failed`/`ok`/`sddlSaved`，修复后回写 |
+| M3 编码 | 文件改为 UTF-8 with BOM，移除中文字面量匹配，只按退出码与复扫判定 |
+| M4 继承 ACE 不一致 | `Probe` 区分显式/继承；扫描计数分开；删除只针对显式形状 |
+| M5 S-1-4 识别过宽 | 精确匹配 `S-1-4-x-y` / `S-1-4-x-y-1` + `GRANT_MASK` + OI/CI（依据 DSH `workspace-sid.ts`/`acl.ts`） |
+| M6 截断后继续 | `truncated` 进结果/manifest 且 `ok=false`；warning 提示只覆盖已扫描对象 |
+| M7 rollback 计数 | `restored` 改为实际动作数，新增 `daclRestored`/`objectsRestored`/`remainingLow`；缺 DACL 记 failed |
+| M8 超时残留 | 还原放入 `finally`；脚本锁与文档说明；kill 仍无法完全避免 |
+| M9 脚本无锁 | `Enter-PathLock`（`%TEMP%\dsh-workspace-integrity-locks`）覆盖 fix/rollback |
+| M10 DACL 不可读 | `daclUnreadable` 计数/样本进入 scan 与结果 |
+| M11 部分失败误报 | 由复扫判定覆盖 |
+| M12 文件路径静默成功 | 入口 `Get-Item` + `PSIsContainer` 校验，文件报错 |
+| 低项 | 死代码移除、`-WhatIf`、`MaxObjects` 校验、根计入计数、records 时间解析排序、`-BackupRoot` 绝对路径、扩展名补充、NULL DACL 报错、标签 SID 校验 |
