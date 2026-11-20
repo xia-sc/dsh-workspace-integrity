@@ -1,0 +1,7 @@
+{
+  "meta": {
+    "title": "Workspace integrity repair",
+    "description": "Restores the Low integrity label left by the Windows sandbox to Medium after a session switches to full access, with an Integrity tab in the session header for scan, repair, verification and rollback.",
+    "detail": "docs/DETAIL.md"
+  }
+}

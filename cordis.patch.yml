@@ -1,0 +1,7 @@
+- insert:
+    - id: workspace-integrity
+      name: '@xia-sc/dsh-workspace-integrity'
+      config:
+        autoClean: true
+        removeAces: false
+        scanAllFiles: false

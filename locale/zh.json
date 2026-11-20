@@ -1,0 +1,7 @@
+{
+  "meta": {
+    "title": "工作区完整性修复",
+    "description": "在会话切到完全权限后，把 Windows 沙箱遗留的 Low 完整性标签恢复为 Medium；会话头部的「完整性」标签里也能直接扫描、修复、校验和回滚。",
+    "detail": "docs/DETAIL.md"
+  }
+}

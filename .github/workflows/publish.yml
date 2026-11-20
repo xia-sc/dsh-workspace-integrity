@@ -1,0 +1,60 @@
+# Publish to npm with Trusted Publishing (OIDC).
+#
+# No npm token is used: the job exchanges GitHub's OIDC identity token for a
+# short-lived publish credential. The matching trusted publisher must be
+# configured on npm with:
+#   package            @xia-sc/dsh-workspace-integrity
+#   repository         xia-sc/dsh-workspace-integrity
+#   workflow filename  publish.yml
+#
+# Trigger it by publishing a GitHub Release (tag must match package.json's
+# version) or by running this workflow manually once OIDC is configured.
+
+name: Publish
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+concurrency:
+  group: npm-publish
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  publish:
+    name: Publish to npm via OIDC
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Ensure a trusted-publishing capable npm
+        run: |
+          npm install -g npm@latest
+          node --version
+          npm --version
+
+      - name: Verify the package name
+        run: |
+          NAME=$(node -p "require('./package.json').name")
+          test "$NAME" = "@xia-sc/dsh-workspace-integrity"
+          echo "publishing $NAME"
+
+      - name: Syntax check
+        run: |
+          node --check index.js
+          node --check client.js
+          node --check routes.js
+
+      - name: Publish
+        run: npm publish --access public --provenance
