@@ -65,38 +65,41 @@ function Invoke-Icacls([string[]]$IcaclsArgs) {
 }
 
 function Set-LabelTree([string]$root, [string]$flags = '(OI)(CI)M') {
-    $direct = Invoke-Icacls @($root, '/setintegritylevel', $flags, '/T', '/C', '/Q')
-    if ($direct.code -eq 0) {
-        return [pscustomobject]@{ ok = $true; text = $direct.text; fallback = $false; restoreError = $null }
-    }
-
-    # A file's owner has implicit READ_CONTROL/WRITE_DAC, not WRITE_OWNER, so a
-    # root without an explicit FullControl ACE cannot receive a label change.
-    # Grant FullControl through WRITE_DAC, retry, then restore the saved DACL.
-    # The restore runs in `finally` so an exception in the retry cannot leave
-    # the temporary grant behind.
+    # icacls 对文件会忽略 (OI)(CI) 继承标志：带该标志时文件标签不变，但命令
+    # 仍可能返回成功；/C 又会让单对象失败不影响退出码。因此不能先用退出码
+    # 判断，必须始终按 WRITE_DAC 临时授予完全控制，执行两遍后按保存的 SDDL
+    # 还原。还原放在 finally 中，重试抛异常也不会留下临时授权。
+    $level = $flags
+    if ($level -match '^\(OI\)\(CI\)(.+)$') { $level = $Matches[1] }
+    $inheritFlags = '(OI)(CI)' + $level
     $sddl = $null
     $err = $null
     $saveRc = [Wi]::SaveSddl((ConvertTo-LongPath $root), [ref]$sddl, [ref]$err)
     if ($saveRc -ne 0 -or -not $sddl) {
-        return [pscustomobject]@{ ok = $false; text = $direct.text; fallback = $false; restoreError = "could not save the root DACL: $err" }
+        return [pscustomobject]@{ ok = $false; text = ''; fallback = $false; restoreError = "could not save the root DACL: $err" }
     }
 
     $user = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
     $restoreError = $null
-    $retry = $null
+    $grant = $null
+    $pass1 = $null
+    $pass2 = $null
     try {
-        $null = Invoke-Icacls @($root, '/grant', ($user + ':(OI)(CI)(F)'), '/C', '/Q')
-        $retry = Invoke-Icacls @($root, '/setintegritylevel', $flags, '/T', '/C', '/Q')
+        $grant = Invoke-Icacls @($root, '/grant', ($user + ':(OI)(CI)(F)'), '/C', '/Q')
+        $pass1 = Invoke-Icacls @($root, '/setintegritylevel', $level, '/T', '/C', '/Q')
+        $pass2 = Invoke-Icacls @($root, '/setintegritylevel', $inheritFlags, '/T', '/C', '/Q')
     } finally {
         $restoreErr = $null
         $restoreRc = [Wi]::RestoreSddl((ConvertTo-LongPath $root), [string]$sddl, [ref]$restoreErr)
         if ($restoreRc -ne 0) { $restoreError = "DACL restore failed: $restoreErr" }
     }
-    $retryCode = if ($null -ne $retry) { $retry.code } else { 1 }
+    $grantCode = if ($null -ne $grant) { $grant.code } else { 1 }
+    $code1 = if ($null -ne $pass1) { $pass1.code } else { 1 }
+    $code2 = if ($null -ne $pass2) { $pass2.code } else { 1 }
+    $text = ($(if ($null -ne $grant) { $grant.text } else { '' }) + "`n" + $(if ($null -ne $pass1) { $pass1.text } else { '' }) + "`n" + $(if ($null -ne $pass2) { $pass2.text } else { '' }))
     return [pscustomobject]@{
-        ok = ($retryCode -eq 0 -and -not $restoreError)
-        text = ($direct.text + "`n" + $(if ($null -ne $retry) { $retry.text } else { '' }))
+        ok = ($grantCode -eq 0 -and $code1 -eq 0 -and $code2 -eq 0 -and -not $restoreError)
+        text = $text
         fallback = $true
         restoreError = $restoreError
     }
@@ -928,41 +931,54 @@ function Invoke-Fix([string]$root, [bool]$removeAces, [bool]$allFiles, [bool]$fa
         }
     }
 
-    # Idempotent skip: with no ACE removal, a root that is already Medium
-    # cannot change. `-Fast` skips unconditionally (it never pre-scans).
-    if ($fast -or -not $removeAces) {
+    # 幂等跳过：只有根已经是 Medium 且没有待处理残留时才跳过。手动修复会
+    # 扫描子树，因为子对象可能仍有 Low（例如上一次 /T 部分失败）；fast 不
+    # 预扫，只按根判断。扫描结果在继续修复时复用，避免重复遍历。
+    $preScan = $null
+    $skip = $false
+    if ($fast) {
+        $probe = Get-Info $root
+        $skip = ($probe.readable -and -not $probe.low)
+    } elseif (-not $removeAces) {
         $probe = Get-Info $root
         if ($probe.readable -and -not $probe.low) {
-            return [pscustomobject]@{
-                ok = $true
-                action = 'fix'
-                path = $root
-                whatIf = $false
-                backupDir = $null
-                labelReadable = $true
-                low = 0
-                sandboxSid = 0
-                everyoneDeny = 0
-                unreadable = 0
-                daclUnreadable = 0
-                excluded = $null
-                excludedSamples = @()
-                truncated = $false
-                requestedRemoveAces = $requestedRemoveAces
-                removedAces = 0
-                acesSkipped = $false
-                rootOnly = $fast
-                plan = @()
-                failed = @()
-                note = 'The root label is not Low; skipped.'
-                warning = $null
-                elapsedMs = [int]((Get-Date) - $script:Start).TotalMilliseconds
-            }
+            $preScan = Invoke-Scan $root $allFiles $maxObjects $excludes
+            $skip = ($preScan.low -eq 0)
+        }
+    }
+    if ($skip) {
+        $skipNote = if ($preScan) { 'No Low labels remain; skipped.' } else { 'The root label is not Low; skipped.' }
+        return [pscustomobject]@{
+            ok = $true
+            action = 'fix'
+            path = $root
+            whatIf = $false
+            backupDir = $null
+            labelReadable = $true
+            low = $(if ($preScan) { [int]$preScan.low } else { 0 })
+            sandboxSid = $(if ($preScan) { [int]$preScan.sandboxSid } else { 0 })
+            everyoneDeny = $(if ($preScan) { [int]$preScan.everyoneDeny } else { 0 })
+            unreadable = $(if ($preScan) { [int]$preScan.unreadable } else { 0 })
+            daclUnreadable = $(if ($preScan) { [int]$preScan.daclUnreadable } else { 0 })
+            excluded = $(if ($preScan) { [int]$preScan.excluded } else { $null })
+            excludedSamples = $(if ($preScan) { @($preScan.excludedSamples) } else { @() })
+            truncated = $false
+            requestedRemoveAces = $requestedRemoveAces
+            removedAces = 0
+            acesSkipped = $false
+            rootOnly = $fast
+            plan = @()
+            failed = @()
+            note = $skipNote
+            warning = $null
+            elapsedMs = [int]((Get-Date) - $script:Start).TotalMilliseconds
         }
     }
 
     $scan = $null
-    if (-not $fast) {
+    if ($preScan) {
+        $scan = $preScan
+    } elseif (-not $fast) {
         $scan = Invoke-Scan $root $allFiles $maxObjects $excludes
     } else {
         $scan = [pscustomobject]@{

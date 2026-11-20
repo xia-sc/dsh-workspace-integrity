@@ -141,7 +141,7 @@ workspace_integrity action=rollback backupDir=C:\Users\me\AppData\Local\dsh-work
 - **仅 Windows**：修改强制标签需要 `WRITE_OWNER` 或 `SeRelabelPrivilege`；属主是 Administrators 的盘根目录会返回 Access denied，需要管理员 shell。
 - **不要在 `workspace-write` 会话仍在写工作区时修复**：沙箱内的 Low 令牌需要 Low 标签才能写，提前改成 Medium 会让该会话失去写权限；自动清理只在切到 `danger-full-access` 后触发。
 - **DSH 不会重新打标**：工作区授权按 provider 生命周期缓存，修复后继续用 `workspace-write` 的会话会一直写失败，直到重启 DSH 或换工作区。
-- **幂等跳过只看根标签**：如果上一次清理中途失败、根已是 Medium 但子对象仍是 Low，`fix` 会跳过；先用「校验」确认残留，再用一次非 fast 的 `removeAces: true` 修复，或用管理员 shell 对子树执行 `icacls <path> /setintegritylevel (OI)(CI)M /T /C`。
+- **幂等跳过**：手动修复会先扫描子树，只有整树都没有 Low 时才跳过；根是 Medium 但子对象仍有 Low 时会继续修复。`fast` 自动清理不预扫，只按根判断，子对象残留需要手动修复。
 - **`removeAces` 会改 DACL**：只删除符合 DSH 沙箱形状的显式 ACE（`S-1-4-x-y` / `S-1-4-x-y-1` allow，`GRANT_MASK`，OI|CI；Everyone 的 `FILE_DELETE_CHILD` deny，CI），继承项留给父级。删除前保存对象 DACL，回滚可恢复；仍可能让受限进程恢复删除工作区外文件的能力，只在确实要交还目录时使用。
 - **回滚记录**：保存根 DACL，并在删除 ACE 前保存每个受影响对象的 DACL；`rollback` 恢复两者并复扫 `remainingLow`。0.4.0 之前的旧记录没有对象 DACL，那些删除无法回滚。
 - **自动清理不会删 ACE**：自动路径固定 `removeAces: false`；即使配置开了 `removeAces`，fast 也不会删除，日志会说明。
