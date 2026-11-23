@@ -1,7 +1,5 @@
+# 插件的运行配置由 %DSH_HOME%\dsh-workspace-integrity\config.json 承载；
+# 这里只负责把插件插进 loader 树，不再写 config，避免两处配置互相覆盖。
 - insert:
     - id: workspace-integrity
       name: '@xia-sc/dsh-workspace-integrity'
-      config:
-        autoClean: true
-        removeAces: false
-        scanAllFiles: false

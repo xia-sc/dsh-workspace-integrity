@@ -1,7 +1,7 @@
 import { execFile } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import {
-  appendFileSync, closeSync, existsSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, statSync,
+  appendFileSync, closeSync, existsSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, statSync,
   unlinkSync, writeFileSync, writeSync,
 } from 'node:fs'
 import { homedir } from 'node:os'
@@ -18,12 +18,22 @@ const IS_WIN = process.platform === 'win32'
 const HERE = dirname(fileURLToPath(import.meta.url))
 const SCRIPT = join(HERE, 'scripts', 'Repair.ps1')
 const HOME = process.env.DSH_HOME || join(homedir(), '.dsh')
-const LOG_FILE = join(HOME, 'workspace-integrity.log')
+/** 插件自己的数据目录：日志、冷却状态与配置都收在这里，不再散落在 DSH 主目录根部。 */
+const DATA_DIR = join(HOME, 'dsh-workspace-integrity')
+const LOG_FILE = join(DATA_DIR, 'workspace-integrity.log')
 const BACKUP_ROOT = join(process.env.LOCALAPPDATA || join(homedir(), 'AppData', 'Local'), 'dsh-workspace-integrity')
 const COOLDOWN_MS = 60_000
 const lastRun = new Map()
 /** Cleanup cooldowns survive a remount, so a hot reload cannot re-clean at once. */
-const STATE_FILE = join(HOME, 'workspace-integrity.state.json')
+const STATE_FILE = join(DATA_DIR, 'workspace-integrity.state.json')
+/** 用户可直接编辑的插件配置；缺失时自动生成一份默认值。 */
+const CONFIG_FILE = join(DATA_DIR, 'config.json')
+const DEFAULT_CONFIG = {
+  autoClean: true,
+  removeAces: false,
+  scanAllFiles: false,
+  excludeDirs: ['.git', '.hg', '.svn'],
+}
 /** Who asked for a repair; recorded in the rollback record so it stays honest. */
 const TRIGGERS = ['auto', 'manual', 'tool']
 
@@ -41,7 +51,7 @@ function restoreCooldowns() {
 
 function persistCooldowns() {
   try {
-    mkdirSync(HOME, { recursive: true })
+    mkdirSync(DATA_DIR, { recursive: true })
     const now = Date.now()
     const roots = {}
     for (const [root, at] of lastRun) {
@@ -51,11 +61,42 @@ function persistCooldowns() {
   } catch { /* persistence must never break cleanup */ }
 }
 
+/**
+ * 读取数据目录里的 config.json。文件缺失或损坏时退回空对象，
+ * 由 apply() 用内置默认值与 profile 配置兜底；损坏原因只记日志，不阻断挂载。
+ * @returns {Record<string, unknown>} 文件中的配置，或空对象。
+ */
+function readFileConfig() {
+  let text
+  try {
+    text = readFileSync(CONFIG_FILE, 'utf8')
+  } catch (error) {
+    if (error?.code !== 'ENOENT') log(`config.json unreadable (${error?.message || error}); using defaults`)
+    return {}
+  }
+  try {
+    const parsed = JSON.parse(text.replace(/^\uFEFF/, ''))
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {}
+  } catch {
+    log('config.json is not valid JSON; using defaults')
+    return {}
+  }
+}
+
+/** 首次运行时写出一份 config.json，让用户知道配置放在哪里；种子可带入已有的 profile 配置。 */
+function ensureConfigFile(seed = DEFAULT_CONFIG) {
+  if (existsSync(CONFIG_FILE)) return
+  try {
+    mkdirSync(DATA_DIR, { recursive: true })
+    writeFileSync(CONFIG_FILE, `${JSON.stringify(seed, null, 2)}\n`)
+  } catch { /* 只读的 DSH_HOME 也不能拦住挂载 */ }
+}
+
 restoreCooldowns()
 
 function log(message) {
   try {
-    mkdirSync(HOME, { recursive: true })
+    mkdirSync(DATA_DIR, { recursive: true })
     appendFileSync(LOG_FILE, `[${new Date().toISOString()}] ${message}\n`)
   } catch {
     /* logging must never break the host */
@@ -272,6 +313,16 @@ function normalizeExcludes(value, fallback) {
   return list
 }
 
+/** 把生效配置投影成写回 config.json 的四个字段。 */
+function snapshotConfig(source) {
+  return {
+    autoClean: source.autoClean !== false,
+    removeAces: source.removeAces === true,
+    scanAllFiles: source.scanAllFiles === true,
+    excludeDirs: Array.isArray(source.excludeDirs) ? source.excludeDirs : [],
+  }
+}
+
 // 把排除清单追加为引擎参数；空清单不追加，保持不排除时的旧行为。
 // 以逗号拼接成单个参数，避免 -File 传参把多个值解析成位置参数。
 function appendExcludes(args, excludes) {
@@ -421,13 +472,49 @@ function createOperations(ctx, config) {
         backupRoot: BACKUP_ROOT,
         // What the automatic path last did to this workspace, if anything.
         lastClean: latestRecord(sessionPath),
-        config: {
-          autoClean: config.autoClean !== false,
-          removeAces: config.removeAces === true,
-          scanAllFiles: config.scanAllFiles === true,
-          excludeDirs: config.excludeDirs,
-        },
+        config: snapshotConfig(config),
+        // 面板直接告诉用户去哪儿改排除目录等配置。
+        configFile: CONFIG_FILE,
+        dataDir: DATA_DIR,
       }
+    },
+
+    /** 设置页读取：当前生效配置、存放位置与数据目录。 */
+    config() {
+      return { config: snapshotConfig(config), configFile: CONFIG_FILE, dataDir: DATA_DIR }
+    },
+
+    /**
+     * 设置页保存：只接受四个已知字段，写回 config.json 后立即作用于当前进程，
+     * 不需要重启或重载插件。写入先落临时文件再 rename，避免半截 JSON。
+     */
+    updateConfig(input = {}) {
+      const next = {}
+      for (const key of ['autoClean', 'removeAces', 'scanAllFiles']) {
+        if (input[key] === undefined) continue
+        if (typeof input[key] !== 'boolean') throw userError(`${key} must be a boolean.`)
+        next[key] = input[key]
+      }
+      if (input.excludeDirs !== undefined) {
+        if (typeof input.excludeDirs !== 'string' && !Array.isArray(input.excludeDirs)) {
+          throw userError('excludeDirs must be a string or an array of strings.')
+        }
+        next.excludeDirs = normalizeExcludes(input.excludeDirs, [])
+      }
+      if (Object.keys(next).length === 0) throw userError('No configuration value to save.')
+      const merged = { ...config, ...next }
+      const tmp = `${CONFIG_FILE}.tmp`
+      try {
+        mkdirSync(DATA_DIR, { recursive: true })
+        writeFileSync(tmp, `${JSON.stringify(snapshotConfig(merged), null, 2)}\n`)
+        renameSync(tmp, CONFIG_FILE)
+      } catch (error) {
+        try { unlinkSync(tmp) } catch { /* 清理失败不影响保存结果 */ }
+        throw new Error(`Could not save config.json: ${error?.message || error}`)
+      }
+      Object.assign(config, next)
+      log(`config saved (autoClean=${config.autoClean}, removeAces=${config.removeAces}, scanAllFiles=${config.scanAllFiles}, excludeDirs=${config.excludeDirs.join(',')})`)
+      return { config: snapshotConfig(config), configFile: CONFIG_FILE, dataDir: DATA_DIR }
     },
 
     async scan(input = {}) {
@@ -532,16 +619,19 @@ function summary(action, payload) {
 }
 
 export function apply(ctx, rawConfig = {}) {
+  // 配置来源按优先级从低到高：内置默认值 < profile 里的插件配置 < 数据目录 config.json。
+  // 面板与文档都指向 config.json，用户不必再去改 profile 补丁。
+  const fileConfig = readFileConfig()
   const config = {
-    autoClean: true,
-    removeAces: false,
-    scanAllFiles: false,
-    excludeDirs: ['.git', '.hg', '.svn'],
+    ...DEFAULT_CONFIG,
     ...(rawConfig || {}),
+    ...fileConfig,
   }
   // 配置可能写成字符串或数组；统一规范化，后续扫描/修复/回滚共用同一份清单。
-  config.excludeDirs = normalizeExcludes(config.excludeDirs, ['.git', '.hg', '.svn'])
-  if (IS_WIN) log(`plugin mounted (autoClean=${config.autoClean}, excludeDirs=${config.excludeDirs.join(',')})`)
+  config.excludeDirs = normalizeExcludes(config.excludeDirs, DEFAULT_CONFIG.excludeDirs)
+  // 首次挂载把已生效的配置落盘：profile 里的旧配置会迁进 config.json，之后以文件为准。
+  ensureConfigFile(snapshotConfig(config))
+  if (IS_WIN) log(`plugin mounted (autoClean=${config.autoClean}, excludeDirs=${config.excludeDirs.join(',')}, dataDir=${DATA_DIR})`)
 
   const operations = createOperations(ctx, config)
 
@@ -666,6 +756,8 @@ export function apply(ctx, rawConfig = {}) {
         state: ({ url } = {}) => operations.state({
           sessionId: url ? url.searchParams.get('sessionId') || '' : '',
         }),
+        config: () => operations.config(),
+        updateConfig: (body) => operations.updateConfig(body),
         scan: (body) => operations.scan(body),
         fix: (body) => operations.fix(body),
         verify: (body) => operations.verify(body),

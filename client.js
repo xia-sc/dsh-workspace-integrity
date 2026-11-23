@@ -93,6 +93,7 @@ window.__ModuleLoader__.load({
         root: '工作区',
         noRecords: '暂无回滚记录。',
         backupRoot: '回滚记录目录',
+        configFile: '配置文件',
         excludeDirs: '排除目录',
         excluded: '已排除目录',
         none: '无',
@@ -113,6 +114,17 @@ window.__ModuleLoader__.load({
         onlySid: '沙箱',
         onlyDeny: 'Everyone 删除拒绝',
         fixHint: '已写入回滚记录，可用「回滚记录」恢复。',
+        settingsTitle: '插件设置',
+        settingsDesc: '这里的改动会写入 config.json，并立即作用于自动清理、面板与工具。',
+        settingsLoading: '读取配置…',
+        settingsSave: '保存设置',
+        settingsSaving: '保存中…',
+        settingsSaved: '已保存到 config.json',
+        settingsPath: '配置文件',
+        autoCleanDesc: '会话切到完全权限时自动清理当前工作区。',
+        removeAcesDesc: '修复时同时删除非继承的沙箱权限项和 Everyone 删除拒绝项；会削弱仍在使用的沙箱。',
+        scanAllFilesDesc: '扫描所有文件，而不只是常见可执行扩展名。',
+        excludeDirsDesc: '逗号或换行分隔。按目录名匹配任意层级，或按相对根的路径前缀匹配。',
       },
       en: {
         nav: 'Integrity',
@@ -179,6 +191,7 @@ window.__ModuleLoader__.load({
         root: 'Workspace',
         noRecords: 'No rollback records yet.',
         backupRoot: 'Rollback records',
+        configFile: 'Config file',
         excludeDirs: 'Excluded dirs',
         excluded: 'Excluded directories',
         none: 'none',
@@ -199,6 +212,17 @@ window.__ModuleLoader__.load({
         onlySid: 'Sandbox',
         onlyDeny: 'Everyone delete deny',
         fixHint: 'A rollback record was written; use Rollback records to undo it.',
+        settingsTitle: 'Plugin settings',
+        settingsDesc: 'Changes here are written to config.json and take effect for automatic cleanup, the panel, and the tool.',
+        settingsLoading: 'Reading configuration…',
+        settingsSave: 'Save settings',
+        settingsSaving: 'Saving…',
+        settingsSaved: 'Saved to config.json',
+        settingsPath: 'Config file',
+        autoCleanDesc: 'Clean the current workspace automatically when the session switches to full access.',
+        removeAcesDesc: 'Also delete non-inherited sandbox entries and the Everyone delete deny; this weakens a sandbox still in use.',
+        scanAllFilesDesc: 'Scan every file, not only common executable extensions.',
+        excludeDirsDesc: 'Separated by commas or newlines. Directory names match at any depth; relative path prefixes match from the root.',
       },
     }
 
@@ -253,6 +277,13 @@ window.__ModuleLoader__.load({
 .dshwi-note { margin: 0; font-size: 12px; line-height: 18px; color: var(--dsw-alias-label-secondary); }
 .dshwi-empty { margin: 0; font-size: 12px; line-height: 18px; color: var(--dsw-alias-label-secondary); }
 .dshwi-records { display: flex; flex-direction: column; gap: 8px; min-width: 0; }
+.dshwi-config { display: flex; flex-direction: column; gap: 10px; width: 100%; max-width: 720px; min-width: 0; }
+.dshwi-config-row { display: flex; align-items: flex-start; gap: 10px; padding: 10px 0; border-top: 1px solid var(--dsw-alias-border-l1); }
+.dshwi-config-label { font-size: 13px; line-height: 20px; font-weight: 500; color: var(--dsw-alias-label-primary); }
+.dshwi-config-desc { margin-top: 2px; font-size: 12px; line-height: 18px; color: var(--dsw-alias-label-secondary); }
+.dshwi-config-row input[type="checkbox"] { flex: none; margin: 3px 0 0; accent-color: var(--dsw-alias-brand-primary); }
+.dshwi-textarea { box-sizing: border-box; width: 100%; min-height: 64px; margin-top: 6px; padding: 8px 10px; border-radius: 8px; border: 1px solid var(--dsw-alias-border-l1); background: var(--dsw-alias-bg-base); color: var(--dsw-alias-label-primary); font: inherit; font-size: 12px; line-height: 18px; resize: vertical; }
+.dshwi-config-actions { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; padding-top: 10px; border-top: 1px solid var(--dsw-alias-border-l1); }
 `
 
     function interpolate(text, params) {
@@ -836,6 +867,11 @@ window.__ModuleLoader__.load({
                 : t('none')))
           : null,
 
+        // 配置不再跟着 DSH profile：直接告诉用户该编辑哪个文件。
+        state && state.configFile
+          ? h('p', { className: 'dshwi-note' }, t('configFile') + ' · ' + String(state.configFile))
+          : null,
+
         error ? h('p', { className: 'dshwi-error', role: 'alert' }, error) : null,
         result ? h(ResultPanel, { result, t }) : null,
         records ? h('div', { className: 'dshwi-records' },
@@ -873,6 +909,157 @@ window.__ModuleLoader__.load({
           : null))
     }
 
+    /** 插件详情页的摘要行：只读，避免与详情页表单共用组件而打乱 hooks 顺序。 */
+    function SettingsSummary(props) {
+      const t = props.t
+      const [config, setConfig] = useState(null)
+      useEffect(function () {
+        let cancelled = false
+        requestJson('/config').then(function (response) {
+          if (!cancelled && response.ok && response.data) setConfig(response.data.config || null)
+        }, function () {})
+        return function () { cancelled = true }
+      }, [])
+      if (!config) return h('span', { className: 'dshwi-note' }, t('settingsLoading'))
+      return h('span', { className: 'dshwi-note' },
+        t('autoClean') + ' · ' + (config.autoClean ? t('on') : t('off')),
+        ' · ',
+        t('excludeDirs') + ' · ' + (
+          Array.isArray(config.excludeDirs) && config.excludeDirs.length > 0
+            ? config.excludeDirs.join(', ')
+            : t('none')))
+    }
+
+    /** 插件详情页的设置表单：读取并保存数据目录里的 config.json。 */
+    function SettingsForm(props) {
+      const t = props.t
+      const [loaded, setLoaded] = useState(false)
+      const [autoClean, setAutoClean] = useState(true)
+      const [removeAces, setRemoveAces] = useState(false)
+      const [scanAllFiles, setScanAllFiles] = useState(false)
+      const [excludeText, setExcludeText] = useState('')
+      const [configFile, setConfigFile] = useState('')
+      const [phase, setPhase] = useState('loading')
+      const [error, setError] = useState(null)
+      const [saved, setSaved] = useState(false)
+
+      function applyConfig(config, file) {
+        if (!config || typeof config !== 'object') return
+        setAutoClean(config.autoClean !== false)
+        setRemoveAces(config.removeAces === true)
+        setScanAllFiles(config.scanAllFiles === true)
+        setExcludeText(Array.isArray(config.excludeDirs) ? config.excludeDirs.join(', ') : '')
+        if (typeof file === 'string') setConfigFile(file)
+      }
+
+      useEffect(function () {
+        let cancelled = false
+        requestJson('/config').then(function (response) {
+          if (cancelled) return
+          if (!response.ok) {
+            setPhase(null)
+            setError(errorText(t, response.error))
+            return
+          }
+          const data = response.data || {}
+          applyConfig(data.config, data.configFile)
+          setLoaded(true)
+          setPhase(null)
+        }, function () {
+          if (cancelled) return
+          setPhase(null)
+          setError(t('requestFailed'))
+        })
+        return function () { cancelled = true }
+      }, [])
+
+      function save() {
+        if (!loaded || phase === 'saving') return
+        setPhase('saving')
+        setError(null)
+        setSaved(false)
+        requestJson('/config', {
+          method: 'POST',
+          body: JSON.stringify({
+            autoClean: autoClean,
+            removeAces: removeAces,
+            scanAllFiles: scanAllFiles,
+            excludeDirs: excludeText,
+          }),
+        }).then(function (response) {
+          setPhase(null)
+          if (!response.ok) {
+            setError(errorText(t, response.error))
+            return
+          }
+          const data = response.data || {}
+          applyConfig(data.config, data.configFile)
+          setSaved(true)
+        }, function () {
+          setPhase(null)
+          setError(t('requestFailed'))
+        })
+      }
+
+      function toggleRow(label, desc, value, onChange) {
+        return h('label', { className: 'dshwi-config-row' },
+          h('input', {
+            type: 'checkbox',
+            checked: value,
+            onChange: function (event) {
+              setSaved(false)
+              onChange(event.target.checked)
+            },
+          }),
+          h('div', null,
+            h('div', { className: 'dshwi-config-label' }, label),
+            h('div', { className: 'dshwi-config-desc' }, desc)))
+      }
+
+      return h('div', { className: 'dshwi-config' },
+        h('style', null, CSS_TEXT),
+        h('h3', { className: 'dshwi-title' }, t('settingsTitle')),
+        h('p', { className: 'dshwi-sub' }, t('settingsDesc')),
+        phase === 'loading' ? h('p', { className: 'dshwi-note' }, t('settingsLoading')) : null,
+        loaded
+          ? h('div', null,
+            toggleRow(t('autoClean'), t('autoCleanDesc'), autoClean, setAutoClean),
+            toggleRow(t('removeAces'), t('removeAcesDesc'), removeAces, setRemoveAces),
+            toggleRow(t('scanAllFiles'), t('scanAllFilesDesc'), scanAllFiles, setScanAllFiles),
+            h('div', { className: 'dshwi-config-row' },
+              h('div', { style: { flex: '1 1 auto', minWidth: 0 } },
+                h('div', { className: 'dshwi-config-label' }, t('excludeDirs')),
+                h('div', { className: 'dshwi-config-desc' }, t('excludeDirsDesc')),
+                h('textarea', {
+                  className: 'dshwi-textarea',
+                  value: excludeText,
+                  placeholder: '.git, .hg, .svn',
+                  onChange: function (event) {
+                    setSaved(false)
+                    setExcludeText(event.target.value)
+                  },
+                }))),
+            h('div', { className: 'dshwi-config-actions' },
+              h('button', {
+                type: 'button',
+                className: 'dshwi-btn primary',
+                disabled: phase === 'saving',
+                onClick: save,
+              }, phase === 'saving' ? t('settingsSaving') : t('settingsSave')),
+              saved ? h('span', { className: 'dshwi-note' }, t('settingsSaved')) : null))
+          : null,
+        configFile ? h('p', { className: 'dshwi-note' }, t('settingsPath') + ' · ' + configFile) : null,
+        error ? h('p', { className: 'dshwi-error' }, error) : null)
+    }
+
+    /** 插件详情页设置入口：summary 给列表行，page 给详情页表单。 */
+    function createSettingsView(t) {
+      return function WorkspaceIntegritySettings(props) {
+        if (props && props.view === 'summary') return h(SettingsSummary, { t })
+        return h(SettingsForm, { t })
+      }
+    }
+
     function apply(ctx) {
       // Chinese is the panel's default and only copy source: no locale.bind here,
       // so a Host or browser set to English cannot turn the panel English. The
@@ -897,6 +1084,7 @@ window.__ModuleLoader__.load({
       }
 
       const View = createView(translate, locale)
+      const Settings = createSettingsView(translate)
       const slots = ctx.slots
       if (!slots || typeof slots.inject !== 'function' || typeof slots.register !== 'function') return
       slots.inject(SLOT, function () {
@@ -906,6 +1094,13 @@ window.__ModuleLoader__.load({
           order: 40,
           label: function () { return translate('nav') },
         }, View)
+      })
+      // 设置放在插件详情页：key 必须等于包名，插件页会在描述与行之间渲染它。
+      slots.inject('plugins.bundle.config', function () {
+        return slots.register({
+          name: 'plugins.bundle.config',
+          key: '@xia-sc/dsh-workspace-integrity',
+        }, Settings)
       })
     }
 

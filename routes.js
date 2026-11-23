@@ -87,6 +87,10 @@ export function registerRoutes(webServer, service) {
 
   try {
     route('/state', ['GET'], (context) => service.state(context))
+    // 同一路径承载读写：webServer 的注册以 path 为键，拆成两条会互相覆盖。
+    route('/config', ['GET', 'POST'], ({ method, body }) => (
+      method === 'GET' ? service.config() : service.updateConfig(body)
+    ))
     route('/scan', ['POST'], ({ body }) => service.scan(body))
     route('/fix', ['POST'], ({ body }) => service.fix(body))
     route('/verify', ['POST'], ({ body }) => service.verify(body))

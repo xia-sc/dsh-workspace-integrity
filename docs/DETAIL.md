@@ -14,6 +14,7 @@ Windows 上使用 DSH 的 `workspace-write` 沙箱后，工作区根目录会被
 
 会话头部的标签行（对话 / 轨迹 / ……）里新增「完整性」，来自 `conversation.view` 插槽；它只在 Windows 上可用，读的是同一份宿主实现：
 
+- 插件详情页（**Plugins** → 工作区完整性）在描述与插件行之间渲染「插件设置」表单：自动清理、扫描所有文件、删除沙箱权限项与排除目录；保存写入数据目录的 `config.json`，宿主内存中的配置同步更新并立即作用于自动清理、面板和工具，表单底部显示配置文件路径。
 - 顶部是状态徽标（未扫描 / 上次自动清理 / 上次清理 / 预演 / 未发现 Low / 发现 N 个 Low 对象 / 已恢复为 Medium / 未改动 / 已回滚：标签恢复为 Low / 修复未完成）；
 - 面板会读当前会话的沙箱模式：`danger-full-access` 时只显示一行「已是完全权限」；`workspace-write` 时说明「修复会让它失去写权限且不会自动恢复，切到完全权限时插件会自动清理，一般不用手动修复」；
 - 「当前会话工作区」默认取这个会话当前所在的目录（`working_directory` 优先，回退 `session.header.cwd`），打开即可直接扫描；自动清理和工具不带 `path` 时也取同一个目录；
@@ -22,7 +23,7 @@ Windows 上使用 DSH 的 `workspace-write` 沙箱后，工作区根目录会被
 - 「修复」和「回滚」需要点两次（4 秒内第二次才执行）；「修复」的第二次点击会先重新读一次会话模式，若此时仍是 `workspace-write`，按钮变成「仍要修复（会中断本会话写入）」，要第三次点击才执行；
 - 宿主侧同样有门禁：`fix` 请求不带 `force` 且调用方会话是 `workspace-write` 时直接拒绝；工具调用同理；
 - 两个复选框：`扫描所有文件` 对应 `allFiles`，`同时移除沙箱残留权限项` 对应 `removeAces`（默认关闭，勾选后就地给出削弱沙箱的说明）；
-- 结果区显示 Low 对象数、`S-1-4` 权限项数、Everyone 删除拒绝项、无法读取的对象、DACL 不可读的对象、已删权限项、是否截断与耗时；修复结果还会显示 `warning`/`note` 与预演计划。
+- 结果区显示 Low 对象数、`S-1-4` 权限项数、Everyone 删除拒绝项、无法读取的对象、DACL 不可读的对象、已删权限项、是否截断与耗时；修复结果还会显示 `warning`/`note` 与预演计划；底部显示当前生效的配置文件路径（`%DSH_HOME%\dsh-workspace-integrity\config.json`）。
 
 面板通过同源 JSON 路由（`/workspace-integrity/api/*`）调用宿主。每条路由都声明 `auth: 'required'`，登录与 Host/Origin 校验由 `webServer` 在 HTTP 准入层执行，插件不再自行复制一套；因此面板和工具产生完全相同的状态变化。改标签是特权操作，面板不会弹 UAC，属主是 Administrators 的目录仍然返回 Access denied。
 
@@ -37,7 +38,7 @@ Windows 上使用 DSH 的 `workspace-write` 沙箱后，工作区根目录会被
 
 扫描把「显式项」与「继承项」分开计数（`sandboxSid` / `sandboxInherited` / `everyoneDeny` / `everyoneInherited`），继承项不会被删除。默认扫描目录和常见可执行文件；`allFiles: true` 扫描所有文件。
 
-目录排除由 `-ExcludeDirs`（宿主配置 `excludeDirs`，默认 `.git`、`.hg`、`.svn`）控制：不含反斜杠的条目按目录名匹配任意层级，含反斜杠的条目按相对根的路径前缀匹配。排除在进入子树前生效，被排除目录不计数、不入命中、也不会被删除；结果用 `excluded` 数量与 `excludedSamples`（前 20 条）体现。根目录自身始终检查。
+目录排除由 `-ExcludeDirs`（数据目录 `config.json` 的 `excludeDirs`，默认 `.git`、`.hg`、`.svn`）控制：不含反斜杠的条目按目录名匹配任意层级，含反斜杠的条目按相对根的路径前缀匹配。排除在进入子树前生效，被排除目录不计数、不入命中、也不会被删除；结果用 `excluded` 数量与 `excludedSamples`（前 20 条）体现。根目录自身始终检查。
 
 结果里的 `hits` 是前 500 条命中，`hitsTotal` 是全部命中数；面板最多渲染 500 条，超出时提示「仅显示前 N 条」，这与引擎因 `MaxObjects` 截断产生的 `truncated` 是两件事。
 
@@ -68,7 +69,7 @@ Windows 上使用 DSH 的 `workspace-write` 沙箱后，工作区根目录会被
 - 危险路径默认拒绝：盘根、`%SystemRoot%`、`%ProgramFiles%`、`%ProgramData%`、`%USERPROFILE%` 根、`%SystemDrive%\Users` 根；脚本只有显式 `-AllowDangerousRoot` 才能越过，插件不会自动放行。文件路径与重解析点根也会被拒绝。
 - 自动清理和面板修复共用一把按工作区的锁：同一工作区同时只跑一个修复，后到的那个会得到「已有修复在运行」而不是并发改写 ACL；直接运行脚本时另有一把 `%TEMP%\dsh-workspace-integrity-locks` 下的互斥锁。
 - 自动清理与手动修复共用同一套幂等判断：根非 Low 且不要求删 ACE 时都直接跳过，所以重复点击不会产生空转和记录堆积；fast 与删 ACE 无法同时满足，组合会被拒绝。
-- 清理冷却（60 秒）持久化在 `%DSH_HOME%\workspace-integrity.state.json`：插件重装或 HMR 重挂载后，已经清理过的会话不会立刻再触发一轮检查。
+- 清理冷却（60 秒）持久化在 `%DSH_HOME%\dsh-workspace-integrity\workspace-integrity.state.json`：插件重装或 HMR 重挂载后，已经清理过的会话不会立刻再触发一轮检查。日志在数据目录同级的 `workspace-integrity.log`。
 - 手动修复会先扫描子树：根是 Medium 但子对象仍有 Low 时（例如上一次 `/T` 部分失败），会继续执行标签恢复，直到整树都无 Low 才跳过。`fast` 自动清理不预扫，只按根判断；子对象残留需要手动修复。`Set-LabelTree` 对文件使用不带继承标志的一遍设置，再补回 `(OI)(CI)` 让目录继续继承。
 - 扫描/复扫按 `MaxObjects` 截断：截断会标记 `truncated`，`verify` 与 `fix` 判为未完成（`ok=false`），只修复已扫描对象，不会假装完成；面板命中列表只渲染前 500 条时另有「仅显示前 N 条」提示，不代表引擎截断。
 - 排除目录不会被清理：`excludeDirs` 中的目录既不扫描也不删除，结果与记录用 `excluded` 标记；不要把它当成「已修复」。排除只影响子树，根目录的标签与 DACL 仍会检查。

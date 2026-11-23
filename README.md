@@ -28,11 +28,12 @@ Windows 专用的 DSH 插件包：修复 DSH `workspace-write` 沙箱遗留在�
 | 安全门禁 | 调用方会话仍是 `workspace-write` 时拒绝修复，除非显式 `force` |
 | 并发保护 | 同一工作区在进程内与跨进程都只允许一个修复（独占锁文件） |
 | 状态可查 | 面板显示该工作区「上次清理」时间与来源，自动清理后不再显示「未扫描」 |
-| 冷却持久化 | 60 秒清理冷却写入 `%DSH_HOME%\workspace-integrity.state.json`，插件重载后不重复触发 |
+| 冷却持久化 | 60 秒清理冷却写入 `%DSH_HOME%\dsh-workspace-integrity\workspace-integrity.state.json`，插件重载后不重复触发 |
 | 预演 | 工具 `whatIf: true` / 脚本 `-WhatIf`：只返回计划，不写记录、不改任何 ACL |
 | 对象 DACL 回滚 | `removeAces` 在删除前保存每个受影响对象的 DACL，回滚时逐对象恢复 |
 | 危险路径防护 | 拒绝盘根、`%SystemRoot%`、`%ProgramFiles%`、`%ProgramData%`、用户目录根；脚本侧同样拒绝 |
 | 扫描范围排除 | 默认跳过 `.git`/`.hg`/`.svn`，可按目录名或相对路径前缀配置；被排除目录在结果与记录中计数 |
+| 插件详情页设置 | 在 **Plugins** 页本插件的详情页里编辑自动清理、扫描范围与排除目录，保存后写入 `config.json` 并立即生效 |
 
 ## 安装
 
@@ -92,27 +93,33 @@ workspace_integrity action=rollback backupDir=C:\Users\me\AppData\Local\dsh-work
 | `force` | 会话仍是 `workspace-write` 时强制修复；会让该会话失去工作区写权限且 DSH 不会恢复 |
 | `whatIf` | 只返回计划，不写回滚记录、不改 ACL |
 
+### 插件设置（插件详情页）
+
+打开 **Plugins** 页，点开 **工作区完整性** 的详情页：描述与插件行之间就是设置表单，可以开关自动清理、扫描所有文件、修复时删除沙箱权限项，并编辑排除目录（逗号或换行分隔）。点 **保存设置** 写入 `%DSH_HOME%\dsh-workspace-integrity\config.json`，自动清理、完整性面板与 `workspace_integrity` 工具立即使用新值，不需要重启。表单底部显示当前生效的配置文件路径。
+
 ### 回滚记录与状态文件
 
 - 回滚记录：`%LOCALAPPDATA%\dsh-workspace-integrity\backup-*`
 - 跨进程锁：`%LOCALAPPDATA%\dsh-workspace-integrity\locks\*.lock`（陈旧锁 10 分钟后可被抢占）
-- 冷却状态：`%DSH_HOME%\workspace-integrity.state.json`
-- 日志：`%DSH_HOME%\workspace-integrity.log`
+- 插件数据目录：`%DSH_HOME%\dsh-workspace-integrity\`
+  - 配置：`config.json`（不存在时首次挂载自动生成默认值）
+  - 冷却状态：`workspace-integrity.state.json`
+  - 日志：`workspace-integrity.log`
 
 ## 配置项
 
-在 `cordis.patch.yml` 的插件条目里配置：
+插件配置放在 `%DSH_HOME%\dsh-workspace-integrity\config.json`，首次挂载时自动生成：
 
-```yaml
-- insert:
-    - id: workspace-integrity
-      name: '@xia-sc/dsh-workspace-integrity'
-      config:
-        autoClean: true
-        removeAces: false
-        scanAllFiles: false
-        excludeDirs: ['.git', '.hg', '.svn']
+```json
+{
+  "autoClean": true,
+  "removeAces": false,
+  "scanAllFiles": false,
+  "excludeDirs": [".git", ".hg", ".svn"]
+}
 ```
+
+配置优先级从低到高：内置默认值 → profile 里 `cordis.patch.yml` 的插件 `config` → 数据目录的 `config.json`。平时在插件详情页修改，或直接编辑 `config.json`；`cordis.patch.yml` 只负责把插件插入 loader 树，不再写 `config`，避免两处配置互相覆盖。在详情页保存立即生效；手工改文件后重启 DSH（或重载插件）生效。
 
 | 配置项 | 默认 | 说明 |
 |---|---|---|
@@ -121,7 +128,7 @@ workspace_integrity action=rollback backupDir=C:\Users\me\AppData\Local\dsh-work
 | `scanAllFiles` | `false` | 扫描所有文件，而不是只扫描常见可执行扩展名 |
 | `excludeDirs` | `['.git', '.hg', '.svn']` | 跳过这些目录（按目录名匹配任意层级，或按相对根的路径前缀匹配）；根目录仍会检查 |
 
-面板会以这些值作为初始勾选状态，单次操作可以覆盖，但不会写回配置。
+面板会以这些值作为初始勾选状态，单次操作可以覆盖，但不会写回配置；面板底部会显示当前生效的配置文件路径。
 
 ## 行为与设计
 
@@ -160,7 +167,7 @@ workspace_integrity action=rollback backupDir=C:\Users\me\AppData\Local\dsh-work
 ├── index.js                 # 宿主插件：工具、共享操作、自动清理、路由挂载
 ├── routes.js                # 面板使用的同源 JSON 路由
 ├── client.js                # 浏览器端：完整性面板（默认中文）
-├── cordis.patch.yml         # bundle 的 Loader patch
+├── cordis.patch.yml         # bundle 的 Loader patch（只插入插件，配置在 config.json）
 ├── scripts/Repair.ps1       # ACL 引擎（扫描 / 修复 / 校验 / 回滚 / 记录）
 ├── locale/{zh,en}.json      # 插件显示名与描述
 ├── docs/DETAIL.md           # 行为细节文档
