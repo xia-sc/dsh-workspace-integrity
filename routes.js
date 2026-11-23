@@ -1,10 +1,9 @@
-// Same-origin JSON routes behind the workspace-integrity panel.
+// workspace-integrity 面板背后的同源 JSON 路由。
 //
-// The Client half cannot import Host code, and `ctx.remote` namespaces are
-// fixed at build time by the application assembly, so a plugin's own browser
-// half reaches its Host half over the app's HTTP carrier. Every route is gated
-// by the Connection service (Host/Origin fence + login cookie), so no other
-// local process can drive a label repair.
+// Client 半侧无法 import Host 代码，而 `ctx.remote` 的命名空间在应用组装时固定，
+// 所以插件自己的浏览器半侧经应用自带的 HTTP 载体访问 Host 半侧。
+// 每条路由都声明 `auth: 'required'`：准入（Host/Origin 检查 + 登录 Cookie）由
+// `webServer` 在 HTTP 层执行，插件不再复制一份，因此只有已登录页面能驱动标签修复。
 
 const PREFIX = '/workspace-integrity/api'
 const MAX_BODY_BYTES = 64 * 1024
@@ -17,7 +16,7 @@ function httpError(status, message) {
 
 function sendJson(response, status, payload) {
   if (response.headersSent) {
-    try { response.end() } catch { /* already finished */ }
+    try { response.end() } catch { /* 已经结束 */ }
     return
   }
   response.writeHead(status, {
@@ -49,36 +48,18 @@ async function readJsonBody(request) {
   return parsed
 }
 
-function gate(connection, request, response) {
-  if (!connection || typeof connection.requestRejection !== 'function') return false
-  let rejection
-  try {
-    rejection = connection.requestRejection(request)
-  } catch {
-    rejection = 403
-  }
-  if (rejection === undefined) return false
-  sendJson(response, rejection, {
-    ok: false,
-    error: rejection === 401 ? 'Sign in again before using this panel.' : 'The request origin is not trusted.',
-  })
-  return true
-}
-
 /**
- * Register the panel's JSON routes on the Host HTTP carrier.
- * @param webServer - the `webServer` service.
- * @param connection - the `connection` service used as the request fence.
- * @param service - the operations the agent tool also calls.
- * @returns a disposer that withdraws every route.
+ * 在 Host 的 HTTP 载体上注册面板 JSON 路由。
+ * @param webServer - `webServer` 服务；准入由它的 `auth` 策略负责。
+ * @param service - agent 工具同样调用的那套 operations。
+ * @returns 撤销全部路由的 disposer。
  */
-export function registerRoutes(webServer, connection, service) {
+export function registerRoutes(webServer, service) {
   if (!webServer || typeof webServer.register !== 'function') throw new Error('The webServer service is unavailable.')
   const disposers = []
 
   function route(path, methods, handle) {
     const handler = async function (request, response) {
-      if (gate(connection, request, response)) return
       const method = String(request.method || 'GET').toUpperCase()
       if (methods.indexOf(method) < 0) {
         sendJson(response, 405, { ok: false, error: `Unsupported request method: ${method}` })
@@ -90,12 +71,18 @@ export function registerRoutes(webServer, connection, service) {
         const data = await handle({ method, body, url })
         sendJson(response, 200, { ok: true, data })
       } catch (error) {
-        // 400/413 are the caller's input; anything else is this Host failing.
+        // 400/413 是调用方的输入问题；其余都算本 Host 自身失败。
         const status = typeof error?.status === 'number' ? error.status : 500
         sendJson(response, status, { ok: false, error: String((error && error.message) || error) })
       }
     }
-    disposers.push(webServer.register({ kind: 'exact', path: PREFIX + path, handler }))
+    disposers.push(webServer.register({
+      kind: 'exact',
+      path: PREFIX + path,
+      handler,
+      // 面板能改 ACL，绝不允许匿名访问：认证与 Host/Origin 检查交由载体执行。
+      auth: 'required',
+    }))
   }
 
   try {
@@ -106,11 +93,11 @@ export function registerRoutes(webServer, connection, service) {
     route('/records', ['GET'], () => service.records())
     route('/rollback', ['POST'], ({ body }) => service.rollback(body))
   } catch (error) {
-    // A partial registration must not leak the routes that did register.
+    // 部分注册失败不能泄漏已经注册上的路由。
     for (const dispose of disposers.splice(0)) {
       try {
         if (typeof dispose === 'function') dispose()
-      } catch { /* withdrawal must not throw */ }
+      } catch { /* 撤销不能抛错 */ }
     }
     throw error
   }
@@ -119,7 +106,7 @@ export function registerRoutes(webServer, connection, service) {
     for (const dispose of disposers.splice(0)) {
       try {
         if (typeof dispose === 'function') dispose()
-      } catch { /* withdrawal must not throw */ }
+      } catch { /* 撤销不能抛错 */ }
     }
   }
 }

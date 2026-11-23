@@ -656,31 +656,27 @@ export function apply(ctx, rawConfig = {}) {
     },
   }))
 
-  // The Plugins-page panel talks to the same operations over the app's own
-  // HTTP carrier. Both services are optional: a Host without them keeps the
-  // agent tool and simply never serves the panel.
+  // 插件面板与 agent 工具共用同一套 operations，经应用自带的 HTTP 载体暴露。
+  // webServer 是可选服务：宿主没有它时保留 agent 工具，只是不提供面板。
   ctx.inject(['webServer'], (webCtx) => {
-    // Registered on the carrier's own context: if it reloads, these routes are
-    // withdrawn with it and the next mount registers them again instead of
-    // colliding with the previous registration.
-    webCtx.inject(['connection'], (connCtx) => {
-      try {
-        const disposeRoutes = registerRoutes(webCtx.webServer, connCtx.connection, {
-          state: ({ url } = {}) => operations.state({
-            sessionId: url ? url.searchParams.get('sessionId') || '' : '',
-          }),
-          scan: (body) => operations.scan(body),
-          fix: (body) => operations.fix(body),
-          verify: (body) => operations.verify(body),
-          records: () => operations.records(),
-          rollback: (body) => operations.rollback(body),
-        })
-        webCtx.effect(() => disposeRoutes, 'workspace-integrity: panel routes')
-        log('panel routes registered')
-      } catch (error) {
-        log(`panel routes unavailable: ${String(error && error.message || error)}`)
-      }
-    })
+    // 注册在载体自己的 context 上：它重载时这些路由随之撤销，下次挂载重新注册，
+    // 不会与上一轮注册冲突。准入交给 webServer 的 auth 策略，详见 routes.js。
+    try {
+      const disposeRoutes = registerRoutes(webCtx.webServer, {
+        state: ({ url } = {}) => operations.state({
+          sessionId: url ? url.searchParams.get('sessionId') || '' : '',
+        }),
+        scan: (body) => operations.scan(body),
+        fix: (body) => operations.fix(body),
+        verify: (body) => operations.verify(body),
+        records: () => operations.records(),
+        rollback: (body) => operations.rollback(body),
+      })
+      webCtx.effect(() => disposeRoutes, 'workspace-integrity: panel routes')
+      log('panel routes registered')
+    } catch (error) {
+      log(`panel routes unavailable: ${String(error && error.message || error)}`)
+    }
   })
 
   if (!IS_WIN || config.autoClean === false) return

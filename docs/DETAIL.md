@@ -24,7 +24,7 @@ Windows 上使用 DSH 的 `workspace-write` 沙箱后，工作区根目录会被
 - 两个复选框：`扫描所有文件` 对应 `allFiles`，`同时移除沙箱残留权限项` 对应 `removeAces`（默认关闭，勾选后就地给出削弱沙箱的说明）；
 - 结果区显示 Low 对象数、`S-1-4` 权限项数、Everyone 删除拒绝项、无法读取的对象、DACL 不可读的对象、已删权限项、是否截断与耗时；修复结果还会显示 `warning`/`note` 与预演计划。
 
-面板通过同源 JSON 路由（`/workspace-integrity/api/*`）调用宿主，路由由 `connection` 服务做登录与来源校验，因此面板和工具产生完全相同的状态变化。改标签是特权操作，面板不会弹 UAC，属主是 Administrators 的目录仍然返回 Access denied。
+面板通过同源 JSON 路由（`/workspace-integrity/api/*`）调用宿主。每条路由都声明 `auth: 'required'`，登录与 Host/Origin 校验由 `webServer` 在 HTTP 准入层执行，插件不再自行复制一套；因此面板和工具产生完全相同的状态变化。改标签是特权操作，面板不会弹 UAC，属主是 Administrators 的目录仍然返回 Access denied。
 
 ## 扫描
 
